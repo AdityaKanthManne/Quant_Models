@@ -1,0 +1,92 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "horizon": 10,
+    "maxlags": 5,
+    "lags": null,
+    "ic": "aic",
+    "rolling": true,
+    "window": 756,
+    "step": 5,
+    "use_log_returns": true,
+    "standardize": true,
+    "dropna": true,
+    "seed": 42,
+    "out_full_csv": "level91_conn_full.csv",
+    "out_roll_summary_csv": "level91_conn_rolling_summary.csv",
+    "out_roll_edges_csv": "level91_conn_rolling_edges.csv",
+    "out_json": "level91_conn_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020,
+    "assets": 8
+  },
+  "full_sample": {
+    "lags_used": 4,
+    "TCI": 59.41784142140758,
+    "NET_top_positive": [
+      [
+        "SPY",
+        13.474021212808873
+      ],
+      [
+        "EFA",
+        6.396012791775341
+      ],
+      [
+        "IWM",
+        1.158188608081001
+      ],
+      [
+        "QQQ",
+        1.1055998301329528
+      ],
+      [
+        "EEM",
+        -1.387090047936279
+      ]
+    ],
+    "NET_top_negative": [
+      [
+        "GLD",
+        -7.6053285838562354
+      ],
+      [
+        "TLT",
+        -6.6600832002691295
+      ],
+      [
+        "LQD",
+        -6.481320610736518
+      ],
+      [
+        "EEM",
+        -1.387090047936279
+      ],
+      [
+        "QQQ",
+        1.1055998301329528
+      ]
+    ]
+  },
+  "rolling": {
+    "n_points": 653,
+    "tci_min": 58.452707582912765,
+    "tci_max": 70.11297375481912,
+    "tci_last": 60.35542076400871,
+    "date_first": "2013-01-04",
+    "date_last": "2025-12-19"
+  }
+}

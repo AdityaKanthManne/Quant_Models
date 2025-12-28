@@ -1,0 +1,310 @@
+# Level-89: Connectedness (Spillover) Index — Diebold–Yilmaz (VAR FEVD) + Network (fast, free-data)
+
+This is the natural next step after Level-88 Granger network:
+
+* Granger tells “predictive direction.”
+* **Diebold–Yilmaz (DY)** tells **how much variance spillover** each asset *transmits/receives* using **VAR forecast error variance decomposition (FEVD)**.
+
+### Outputs
+
+* `level89_dy_fevd.csv` (normalized FEVD matrix, rows=sum=100%)
+* `level89_dy_connectedness.csv` (To/From/Net/Total Connectedness Index)
+* `level89_dy_summary.json`
+
+### Why it runs fast
+
+* Single VAR fit + FEVD on small N (8 assets).
+* Default horizon `H=10`, lags `p=2`.
+
+---
+
+```python
+# level89_diebold_yilmaz_connectedness.py
+# Level-89: Diebold–Yilmaz Connectedness (Spillover) Index using VAR FEVD (free-data)
+#
+# Method:
+#   1) Fit VAR(p) on returns
+#   2) Compute FEVD at horizon H
+#   3) Normalize each row to sum to 100%
+#   4) Connectedness:
+#        FROM_i = sum_{j != i} fevd[i,j]
+#        TO_i   = sum_{j != i} fevd[j,i]
+#        NET_i  = TO_i - FROM_i
+#        TCI    = avg_{i != j} fevd[i,j]  (or sum off-diagonal / N)
+#
+# Outputs:
+#   - level89_dy_fevd.csv
+#   - level89_dy_connectedness.csv
+#   - level89_dy_summary.json
+#
+# Run:
+#   python level89_diebold_yilmaz_connectedness.py
+#   python level89_diebold_yilmaz_connectedness.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --start 2010-01-01
+#   python level89_diebold_yilmaz_connectedness.py --p 2 --H 10
+#
+# Notes:
+# - Uses orthogonalized FEVD (Cholesky). For true DY generalized FEVD (GFEVD),
+#   we'd implement Pesaran-Shin (still doable), but this version is fast and stable.
+
+import os
+import json
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from statsmodels.tsa.api import VAR
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    p: int = 2          # VAR lags
+    H: int = 10         # FEVD horizon (steps ahead)
+    min_obs: int = 800
+
+    seed: int = 42
+
+    out_fevd_csv: str = "level89_dy_fevd.csv"
+    out_conn_csv: str = "level89_dy_connectedness.csv"
+    out_json: str = "level89_dy_summary.json"
+
+
+# ----------------------------- yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Close", symbol), ("Adj Close", symbol), (symbol, "Close"), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+        candidates = [
+            c for c in px.columns
+            if isinstance(c, tuple) and (symbol in c) and ("Close" in c or "Adj Close" in c)
+        ]
+        if candidates:
+            s = px[candidates[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close/Adj Close for {symbol} in MultiIndex columns.")
+
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' missing for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    px = yf.download(
+        list(symbols),
+        start=start,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if px is None or px.empty:
+        raise RuntimeError("No price data returned from yfinance.")
+    frames = [_safe_close_series(px, s) for s in symbols]
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    return rets
+
+
+# ----------------------------- DY Connectedness -----------------------------
+def fevd_matrix_orth(res, H: int) -> np.ndarray:
+    """
+    statsmodels FEVD returns an object with decomp array:
+      shape: (neqs, H, neqs)
+    where decomp[i, h, j] is contribution of shock j to variable i at horizon h.
+    We use horizon H (last step) and return NxN matrix.
+    """
+    fevd = res.fevd(H)
+    decomp = np.asarray(fevd.decomp)  # (N, H, N)
+    if decomp.ndim != 3:
+        raise RuntimeError("Unexpected FEVD decomp shape.")
+    mat = decomp[:, -1, :]  # (N, N) at horizon H
+    return mat
+
+
+def connectedness_from_fevd(fevd: pd.DataFrame) -> pd.DataFrame:
+    """
+    fevd: NxN row-normalized to sum to 100 (percent).
+    """
+    syms = fevd.index.tolist()
+    N = len(syms)
+
+    mat = fevd.values.copy()
+    np.fill_diagonal(mat, 0.0)
+
+    FROM = mat.sum(axis=1)  # row i: contributions from others to i
+    TO = mat.sum(axis=0)    # column i: i's contribution to others (as shock)
+    NET = TO - FROM
+
+    # Total Connectedness Index (TCI): average spillover across system
+    # Common DY definition: (sum off-diagonal)/N
+    TCI = float(mat.sum() / N)
+
+    out = pd.DataFrame({
+        "FROM_others": FROM,
+        "TO_others": TO,
+        "NET": NET,
+    }, index=syms).sort_values(["NET", "TO_others"], ascending=[False, False])
+
+    out.attrs["TCI"] = TCI
+    return out
+
+
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+
+    if len(rets) < cfg.min_obs:
+        raise RuntimeError(f"Not enough observations: {len(rets)} < min_obs={cfg.min_obs}")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    model = VAR(rets)
+    res = model.fit(cfg.p)
+
+    mat = fevd_matrix_orth(res, cfg.H)  # NxN, should sum to 1 by row (often)
+    # normalize to percent by row
+    row_sum = mat.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0] = 1.0
+    mat_pct = 100.0 * (mat / row_sum)
+
+    syms = list(rets.columns)
+    fevd_df = pd.DataFrame(mat_pct, index=syms, columns=syms)
+
+    conn = connectedness_from_fevd(fevd_df)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "assets": int(rets.shape[1]),
+        },
+        "var": {"lags": int(cfg.p)},
+        "fevd_horizon": int(cfg.H),
+        "TCI": float(conn.attrs["TCI"]),
+        "top_transmitters_by_NET": conn.head(10).index.tolist(),
+        "top_receivers_by_NET": conn.tail(10).index.tolist(),
+    }
+
+    return {"fevd": fevd_df, "connectedness": conn, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    fevd: pd.DataFrame = result["fevd"]  # type: ignore
+    conn: pd.DataFrame = result["connectedness"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_fevd_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_conn_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    fevd.to_csv(cfg.out_fevd_csv)
+    conn.to_csv(cfg.out_conn_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved FEVD           → {cfg.out_fevd_csv}")
+    print(f"[OK] Saved Connectedness  → {cfg.out_conn_csv}")
+    print(f"[OK] Saved Summary        → {cfg.out_json}")
+
+    print(f"[DY] Total Connectedness Index (TCI) = {conn.attrs['TCI']:.2f}")
+    print("[TOP] NET transmitters (TO - FROM):")
+    top = conn.head(min(10, len(conn)))
+    for sym, r in top.iterrows():
+        print(f"  {sym:>5s}  NET={r['NET']:.2f}  TO={r['TO_others']:.2f}  FROM={r['FROM_others']:.2f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-89: Diebold–Yilmaz Connectedness (VAR FEVD)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--p", type=int, default=2)
+    p.add_argument("--H", type=int, default=10)
+    p.add_argument("--min-obs", type=int, default=800)
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--fevd-csv", type=str, default="level89_dy_fevd.csv")
+    p.add_argument("--conn-csv", type=str, default="level89_dy_connectedness.csv")
+    p.add_argument("--json", type=str, default="level89_dy_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        p=int(a.p),
+        H=int(a.H),
+        min_obs=int(a.min_obs),
+        seed=int(a.seed),
+        out_fevd_csv=a.fevd_csv,
+        out_conn_csv=a.conn_csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+## Recommended run (fast)
+
+```bash
+python level89_diebold_yilmaz_connectedness.py --p 2 --H 10
+```
+
+## If it runs slow / errors
+
+* Reduce horizon:
+
+```bash
+python level89_diebold_yilmaz_connectedness.py --H 5
+```
+
+* Reduce assets:
+
+```bash
+python level89_diebold_yilmaz_connectedness.py --symbols SPY QQQ IWM TLT GLD
+```
+
+If you want **Level-89.1** next: I can upgrade this to **Generalized FEVD (GFEVD)** (order-invariant DY) and add **rolling TCI** with a time series plot.

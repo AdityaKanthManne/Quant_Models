@@ -1,0 +1,354 @@
+```python
+# level90_rolling_dy_connectedness.py
+# Level-90: Rolling Diebold–Yilmaz Connectedness (VAR FEVD) + Time-Series TCI (free-data)
+#
+# What this adds vs Level-89:
+#   - Rolling-window VAR(p) estimation
+#   - FEVD at horizon H per window
+#   - Time series of:
+#       * TCI (Total Connectedness Index)
+#       * TO / FROM / NET for each asset over time
+#   - Saves:
+#       1) level90_tci.csv                  (TCI time series)
+#       2) level90_net_to_from_timeseries.csv (NET/TO/FROM per asset over time)
+#       3) level90_last_window_fevd.csv     (FEVD matrix for the final window)
+#       4) level90_summary.json
+#
+# Notes:
+#   - Uses orthogonalized FEVD (Cholesky). Fast & stable.
+#   - Rolling VAR can be slow if window is huge. Defaults are chosen to be practical.
+#
+# Run examples:
+#   python level90_rolling_dy_connectedness.py
+#   python level90_rolling_dy_connectedness.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --start 2010-01-01
+#   python level90_rolling_dy_connectedness.py --window 756 --step 5 --p 2 --H 10
+#   python level90_rolling_dy_connectedness.py --window 504 --step 10 --H 5
+#
+# Tips if slow:
+#   - Increase --step (e.g., 5, 10, 20)
+#   - Reduce --window (e.g., 252 or 504)
+#   - Reduce assets
+
+import os
+import json
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from statsmodels.tsa.api import VAR
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    p: int = 2                 # VAR lags
+    H: int = 10                # FEVD horizon
+    window: int = 756          # rolling window size in trading days (~3y)
+    step: int = 5              # compute every N days (speed knob)
+    min_obs: int = 900         # minimum total returns required (full sample)
+
+    seed: int = 42
+
+    out_tci_csv: str = "level90_tci.csv"
+    out_net_csv: str = "level90_net_to_from_timeseries.csv"
+    out_last_fevd_csv: str = "level90_last_window_fevd.csv"
+    out_json: str = "level90_summary.json"
+
+
+# ----------------------------- yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Close", symbol), ("Adj Close", symbol), (symbol, "Close"), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+        candidates = [
+            c for c in px.columns
+            if isinstance(c, tuple) and (symbol in c) and ("Close" in c or "Adj Close" in c)
+        ]
+        if candidates:
+            s = px[candidates[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close/Adj Close for {symbol} in MultiIndex columns.")
+
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' missing for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    px = yf.download(
+        list(symbols),
+        start=start,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if px is None or px.empty:
+        raise RuntimeError("No price data returned from yfinance.")
+    frames = [_safe_close_series(px, s) for s in symbols]
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    return rets
+
+
+# ----------------------------- DY helpers -----------------------------
+def fevd_matrix_orth(res, H: int) -> np.ndarray:
+    """
+    Orthogonalized FEVD at horizon H from statsmodels:
+      decomp shape: (N, H, N)
+      decomp[i,h,j] = contribution of shock j to variable i at horizon h
+    """
+    fevd = res.fevd(H)
+    decomp = np.asarray(fevd.decomp)
+    mat = decomp[:, -1, :]  # (N,N) at horizon H
+    return mat
+
+
+def normalize_rows_to_pct(mat: np.ndarray) -> np.ndarray:
+    row_sum = mat.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0.0] = 1.0
+    return 100.0 * (mat / row_sum)
+
+
+def connectedness_stats(fevd_pct: np.ndarray) -> Dict[str, np.ndarray | float]:
+    """
+    fevd_pct: NxN, rows sum to 100
+    """
+    N = fevd_pct.shape[0]
+    mat = fevd_pct.copy()
+    np.fill_diagonal(mat, 0.0)
+
+    FROM = mat.sum(axis=1)  # contributions from others to i
+    TO = mat.sum(axis=0)    # i contributes to others (as a shock)
+    NET = TO - FROM
+
+    # DY Total Connectedness Index: sum off-diagonal / N
+    TCI = float(mat.sum() / N)
+    return {"FROM": FROM, "TO": TO, "NET": NET, "TCI": TCI}
+
+
+# ----------------------------- Rolling pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+
+    if len(rets) < cfg.min_obs:
+        raise RuntimeError(f"Not enough observations: {len(rets)} < min_obs={cfg.min_obs}")
+    if cfg.window <= cfg.p + 20:
+        raise RuntimeError("window too small vs p; increase window or reduce p.")
+    if cfg.step < 1:
+        raise RuntimeError("step must be >= 1")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+    print(f"[INFO] Rolling VAR: window={cfg.window}, step={cfg.step}, p={cfg.p}, H={cfg.H}")
+
+    syms = list(rets.columns)
+    N = len(syms)
+
+    tci_rows: List[Dict[str, object]] = []
+    net_rows: List[Dict[str, object]] = []
+
+    last_fevd_df: pd.DataFrame | None = None
+
+    idx = rets.index
+    start_i = cfg.window
+    end_i = len(rets)
+
+    # Compute every `step` days to control runtime
+    for t in range(start_i, end_i, cfg.step):
+        win = rets.iloc[t - cfg.window:t].copy()
+        ts = idx[t - 1]  # label by window end date
+
+        # Fit VAR
+        try:
+            res = VAR(win).fit(cfg.p)
+            mat = fevd_matrix_orth(res, cfg.H)
+            mat_pct = normalize_rows_to_pct(mat)
+        except Exception:
+            # Skip problematic windows (rare: collinearity, singularities)
+            continue
+
+        stats = connectedness_stats(mat_pct)
+
+        tci_rows.append({
+            "date": ts,
+            "TCI": stats["TCI"],
+        })
+
+        row = {"date": ts}
+        for i, s in enumerate(syms):
+            row[f"FROM_{s}"] = float(stats["FROM"][i])  # type: ignore[index]
+            row[f"TO_{s}"] = float(stats["TO"][i])      # type: ignore[index]
+            row[f"NET_{s}"] = float(stats["NET"][i])    # type: ignore[index]
+        net_rows.append(row)
+
+        last_fevd_df = pd.DataFrame(mat_pct, index=syms, columns=syms)
+
+    if not tci_rows:
+        raise RuntimeError("No rolling windows computed (try increasing step=1, window, or reducing p/assets).")
+
+    tci = pd.DataFrame(tci_rows).set_index("date").sort_index()
+    net = pd.DataFrame(net_rows).set_index("date").sort_index()
+
+    # If last_fevd_df missing (extremely unlikely), build it from last available
+    if last_fevd_df is None:
+        last_date = tci.index[-1]
+        last_row = net.loc[last_date]
+        # can't reconstruct matrix from NET; so just raise:
+        raise RuntimeError("Could not compute last FEVD matrix.")
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "assets": int(N),
+        },
+        "rolling": {
+            "windows_computed": int(len(tci)),
+            "first_window_end": str(tci.index.min().date()),
+            "last_window_end": str(tci.index.max().date()),
+            "TCI_mean": float(tci["TCI"].mean()),
+            "TCI_min": float(tci["TCI"].min()),
+            "TCI_max": float(tci["TCI"].max()),
+        },
+        "last_window": {
+            "date": str(tci.index.max().date()),
+            "top_NET_transmitters": (
+                net.loc[tci.index.max()][[c for c in net.columns if c.startswith("NET_")]]
+                .sort_values(ascending=False)
+                .head(5)
+                .index.tolist()
+            ),
+            "top_NET_receivers": (
+                net.loc[tci.index.max()][[c for c in net.columns if c.startswith("NET_")]]
+                .sort_values(ascending=True)
+                .head(5)
+                .index.tolist()
+            ),
+        }
+    }
+
+    return {"tci": tci, "net": net, "last_fevd": last_fevd_df, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    tci: pd.DataFrame = result["tci"]  # type: ignore
+    net: pd.DataFrame = result["net"]  # type: ignore
+    last_fevd: pd.DataFrame = result["last_fevd"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_tci_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_net_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_last_fevd_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    tci.to_csv(cfg.out_tci_csv)
+    net.to_csv(cfg.out_net_csv)
+    last_fevd.to_csv(cfg.out_last_fevd_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved TCI series      → {cfg.out_tci_csv}")
+    print(f"[OK] Saved NET/TO/FROM    → {cfg.out_net_csv}")
+    print(f"[OK] Saved last FEVD      → {cfg.out_last_fevd_csv}")
+    print(f"[OK] Saved summary        → {cfg.out_json}")
+
+    print(f"[ROLL] Windows computed: {len(tci)} | Last date: {tci.index.max().date()} | "
+          f"TCI mean={tci['TCI'].mean():.2f}, min={tci['TCI'].min():.2f}, max={tci['TCI'].max():.2f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-90: Rolling Diebold–Yilmaz Connectedness (VAR FEVD)")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--p", type=int, default=2)
+    p.add_argument("--H", type=int, default=10)
+    p.add_argument("--window", type=int, default=756)
+    p.add_argument("--step", type=int, default=5)
+    p.add_argument("--min-obs", type=int, default=900)
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--tci-csv", type=str, default="level90_tci.csv")
+    p.add_argument("--net-csv", type=str, default="level90_net_to_from_timeseries.csv")
+    p.add_argument("--last-fevd-csv", type=str, default="level90_last_window_fevd.csv")
+    p.add_argument("--json", type=str, default="level90_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        p=int(a.p),
+        H=int(a.H),
+        window=int(a.window),
+        step=int(a.step),
+        min_obs=int(a.min_obs),
+        seed=int(a.seed),
+        out_tci_csv=a.tci_csv,
+        out_net_csv=a.net_csv,
+        out_last_fevd_csv=a.last_fevd_csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### Fast defaults (recommended)
+
+```bash
+python level90_rolling_dy_connectedness.py --window 756 --step 10 --p 2 --H 10
+```
+
+### If it still feels slow
+
+* Use fewer assets:
+
+```bash
+python level90_rolling_dy_connectedness.py --symbols SPY QQQ IWM TLT GLD --window 504 --step 10
+```
+
+If you want **Level-91**, I’ll add **Generalized FEVD (order-invariant DY)** + **rolling network graphs** (top-k edges per window) saved as CSVs so you can animate the network in Plotly.

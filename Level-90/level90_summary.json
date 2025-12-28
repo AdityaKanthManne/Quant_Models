@@ -1,0 +1,56 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "p": 2,
+    "H": 10,
+    "window": 756,
+    "step": 5,
+    "min_obs": 900,
+    "seed": 42,
+    "out_tci_csv": "level90_tci.csv",
+    "out_net_csv": "level90_net_to_from_timeseries.csv",
+    "out_last_fevd_csv": "level90_last_window_fevd.csv",
+    "out_json": "level90_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020,
+    "assets": 8
+  },
+  "rolling": {
+    "windows_computed": 653,
+    "first_window_end": "2013-01-04",
+    "last_window_end": "2025-12-19",
+    "TCI_mean": 53.88600882272992,
+    "TCI_min": 50.12340867918242,
+    "TCI_max": 59.92475213089727
+  },
+  "last_window": {
+    "date": "2025-12-19",
+    "top_NET_transmitters": [
+      "NET_SPY",
+      "NET_TLT",
+      "NET_GLD",
+      "NET_EFA",
+      "NET_IWM"
+    ],
+    "top_NET_receivers": [
+      "NET_LQD",
+      "NET_QQQ",
+      "NET_EEM",
+      "NET_IWM",
+      "NET_EFA"
+    ]
+  }
+}

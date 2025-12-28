@@ -1,0 +1,503 @@
+```python
+# level91_generalized_connectedness.py
+# Level-91: Generalized Spillover / Connectedness (Diebold–Yilmaz, order-invariant)
+#
+# What this adds vs Level-90:
+# - Uses Generalized FEVD (GFEVD / Pesaran–Shin), so results are NOT sensitive to VAR ordering.
+# - Produces:
+#   1) Full-sample connectedness table
+#   2) Rolling connectedness (TCI / TO / FROM / NET)
+#   3) Rolling edge list (directed network weights)
+#
+# Data:
+# - Free daily prices via yfinance
+#
+# Outputs:
+# - level91_conn_full.csv                   (full-sample connectedness table)
+# - level91_conn_rolling_summary.csv        (rolling TCI + TO/FROM/NET per asset)
+# - level91_conn_rolling_edges.csv          (rolling directed edges: i -> j weights)
+# - level91_conn_summary.json               (config + top dates + stats)
+#
+# Run examples:
+#   python level91_generalized_connectedness.py
+#   python level91_generalized_connectedness.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --start 2010-01-01
+#   python level91_generalized_connectedness.py --window 756 --horizon 10 --maxlags 5 --lags 1
+#   python level91_generalized_connectedness.py --no-rolling
+#
+# Notes:
+# - VAR is fit on returns (log returns). You can optionally standardize.
+# - GFEVD formula is order-invariant; this is the main upgrade.
+# - We set returns to business-day freq to avoid statsmodels frequency warnings.
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from statsmodels.tsa.api import VAR
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    # VAR / FEVD params
+    horizon: int = 10              # H steps for FEVD
+    maxlags: int = 5               # for lag selection if lags is None
+    lags: Optional[int] = None     # fixed lag order; if None -> use AIC selection up to maxlags
+    ic: str = "aic"                # information criterion for selection
+
+    # Rolling
+    rolling: bool = True
+    window: int = 756              # ~3 years of trading days
+    step: int = 5                  # compute every N days to speed up
+
+    # Data / preprocessing
+    use_log_returns: bool = True
+    standardize: bool = True       # z-score each series in rolling window before VAR
+    dropna: bool = True
+
+    seed: int = 42
+
+    # Output files
+    out_full_csv: str = "level91_conn_full.csv"
+    out_roll_summary_csv: str = "level91_conn_rolling_summary.csv"
+    out_roll_edges_csv: str = "level91_conn_rolling_edges.csv"
+    out_json: str = "level91_conn_summary.json"
+
+
+# ----------------------------- Data -----------------------------
+def _safe_close(px: pd.DataFrame) -> pd.Series:
+    # yfinance sometimes returns MultiIndex when downloading multiple symbols; here we download per symbol
+    if "Adj Close" in px.columns:
+        return px["Adj Close"]
+    if "Close" in px.columns:
+        return px["Close"]
+    raise RuntimeError(f"Missing Close/Adj Close. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=False, progress=False)
+        if px is None or px.empty:
+            raise RuntimeError(f"No price data for {s}")
+        close = _safe_close(px).rename(s)
+        frames.append(close)
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool = True) -> pd.DataFrame:
+    if use_log:
+        rets = np.log(prices).diff()
+    else:
+        rets = prices.pct_change()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    # Give statsmodels a business-day frequency (prevents freq warning; harmless otherwise)
+    try:
+        rets = rets.asfreq("B")
+    except Exception:
+        pass
+    return rets.dropna() if True else rets
+
+
+def zscore(df: pd.DataFrame) -> pd.DataFrame:
+    mu = df.mean(axis=0)
+    sd = df.std(axis=0, ddof=1).replace(0.0, np.nan)
+    out = (df - mu) / sd
+    return out.dropna(how="any")
+
+
+# ----------------------------- VAR + Generalized FEVD -----------------------------
+def select_lag(endog: pd.DataFrame, maxlags: int, ic: str) -> int:
+    # statsmodels VAR select_order sometimes fails with short samples; guard it
+    model = VAR(endog)
+    sel = model.select_order(maxlags=maxlags)
+    p = getattr(sel, ic)
+    if p is None or (isinstance(p, (float, int)) and (np.isnan(p) or p <= 0)):
+        # fallback
+        return 1
+    return int(p)
+
+
+def fit_var(endog: pd.DataFrame, lags: Optional[int], maxlags: int, ic: str):
+    model = VAR(endog)
+    p = int(lags) if lags is not None else select_lag(endog, maxlags=maxlags, ic=ic)
+    res = model.fit(p)
+    return res, p
+
+
+def generalized_fevd(res, H: int) -> np.ndarray:
+    """
+    Pesaran–Shin generalized FEVD for VAR:
+    theta_{ij}(H) = (sigma_jj^{-1} * sum_{h=0}^{H-1} (e_i' Psi_h Sigma e_j)^2)
+                    / (sum_{h=0}^{H-1} e_i' Psi_h Sigma Psi_h' e_i)
+
+    Returns:
+      Theta (N x N), row-normalized so each row sums to 1.
+    """
+    Sigma = np.asarray(res.sigma_u)  # (N x N)
+    N = Sigma.shape[0]
+
+    # MA reps Psi_h (0..H-1), each is (N x N)
+    Psi = res.ma_rep(H - 1)  # returns array (H x N x N) including h=0
+    # Defensive: ensure shape is correct
+    Psi = np.asarray(Psi)
+    if Psi.ndim != 3 or Psi.shape[0] < H:
+        raise RuntimeError(f"Unexpected ma_rep shape: {Psi.shape}")
+
+    # Precompute denominators for each i
+    denom = np.zeros(N, dtype=float)
+    for i in range(N):
+        s = 0.0
+        ei = np.zeros(N); ei[i] = 1.0
+        for h in range(H):
+            Ph = Psi[h]
+            v = ei @ Ph @ Sigma @ Ph.T @ ei
+            s += float(v)
+        denom[i] = max(s, 1e-18)
+
+    Theta = np.zeros((N, N), dtype=float)
+    diag = np.diag(Sigma).copy()
+    diag = np.where(diag <= 0, np.nan, diag)  # avoid invalid
+    for i in range(N):
+        ei = np.zeros(N); ei[i] = 1.0
+        for j in range(N):
+            ej = np.zeros(N); ej[j] = 1.0
+            numer = 0.0
+            for h in range(H):
+                Ph = Psi[h]
+                # scalar = e_i' Ph Sigma e_j
+                s_ijh = float(ei @ Ph @ Sigma @ ej)
+                numer += s_ijh * s_ijh
+            if np.isnan(diag[j]):
+                Theta[i, j] = 0.0
+            else:
+                Theta[i, j] = numer / (diag[j] * denom[i])
+
+    # Row-normalize (Diebold–Yilmaz convention)
+    row_sums = Theta.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums <= 0, 1.0, row_sums)
+    Theta = Theta / row_sums
+    return Theta
+
+
+def connectedness_from_theta(theta: np.ndarray, labels: List[str]) -> Dict[str, object]:
+    """
+    Builds connectedness stats from row-normalized FEVD matrix theta.
+    Conventions:
+      - Off-diagonal theta_{ij} is contribution of shocks in j to forecast error variance of i.
+      - FROM_i = sum_{j != i} theta_{ij}
+      - TO_i   = sum_{j != i} theta_{ji}
+      - NET_i  = TO_i - FROM_i
+      - TCI    = 100 * (sum_{i != j} theta_{ij}) / N
+    """
+    N = theta.shape[0]
+    off = theta.copy()
+    np.fill_diagonal(off, 0.0)
+
+    FROM = off.sum(axis=1)              # row sums excluding diag
+    TO = off.sum(axis=0)                # column sums excluding diag (since row-normalized)
+    NET = TO - FROM
+    TCI = 100.0 * off.sum() / N
+
+    # Table format (percent)
+    table = pd.DataFrame(theta * 100.0, index=labels, columns=labels)
+    table["FROM"] = FROM * 100.0
+    table.loc["TO", :] = list(TO * 100.0) + [np.nan]  # append placeholder for FROM col
+    table.loc["NET", :] = list(NET * 100.0) + [np.nan]
+    # Add TCI scalar as a column entry for readability
+    table.loc["TCI", :] = [np.nan] * (N + 1)
+    table.loc["TCI", labels[0]] = TCI  # store it somewhere visible
+
+    stats = {
+        "TCI": float(TCI),
+        "FROM": {labels[i]: float(FROM[i] * 100.0) for i in range(N)},
+        "TO": {labels[i]: float(TO[i] * 100.0) for i in range(N)},
+        "NET": {labels[i]: float(NET[i] * 100.0) for i in range(N)},
+    }
+    return {"table": table, "stats": stats}
+
+
+def theta_to_edges(theta: np.ndarray, labels: List[str]) -> pd.DataFrame:
+    """
+    Directed edges i -> j with weight = contribution from i-shock to j-variance.
+    Since theta_{j,i} is contribution of i to j, we map edge i -> j = theta[j,i].
+    Returns rows: src, dst, weight_pct
+    """
+    N = theta.shape[0]
+    rows = []
+    for i, src in enumerate(labels):
+        for j, dst in enumerate(labels):
+            if i == j:
+                continue
+            w = float(theta[j, i] * 100.0)  # i -> j
+            rows.append({"src": src, "dst": dst, "weight_pct": w})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------- Pipeline -----------------------------
+def compute_connectedness(endog: pd.DataFrame, cfg: Config) -> Dict[str, object]:
+    res, p = fit_var(endog, cfg.lags, cfg.maxlags, cfg.ic)
+    theta = generalized_fevd(res, cfg.horizon)
+    labels = list(endog.columns)
+    conn = connectedness_from_theta(theta, labels)
+    edges = theta_to_edges(theta, labels)
+    return {
+        "lags_used": p,
+        "theta": theta,
+        "table": conn["table"],
+        "stats": conn["stats"],
+        "edges": edges
+    }
+
+
+def run_full_sample(rets: pd.DataFrame, cfg: Config) -> Dict[str, object]:
+    data = rets.copy()
+    if cfg.standardize:
+        data = zscore(data)
+    out = compute_connectedness(data, cfg)
+    return out
+
+
+def run_rolling(rets: pd.DataFrame, cfg: Config) -> Dict[str, object]:
+    idx = rets.index
+    N = rets.shape[1]
+    labels = list(rets.columns)
+
+    roll_rows = []
+    edge_rows = []
+
+    # rolling over end indices for speed: step days
+    ends = list(range(cfg.window, len(rets), cfg.step))
+    for k, end in enumerate(ends, start=1):
+        w = rets.iloc[end - cfg.window:end].copy()
+        if cfg.standardize:
+            w = zscore(w)
+        if len(w) < max(cfg.window // 2, 50):
+            continue
+
+        try:
+            out = compute_connectedness(w, cfg)
+        except Exception:
+            # If VAR fails occasionally (singularity), just skip
+            continue
+
+        dt = idx[end - 1]
+        stats = out["stats"]
+
+        row = {"date": dt, "TCI": stats["TCI"], "lags_used": out["lags_used"]}
+        # store TO/FROM/NET per asset (pct)
+        for a in labels:
+            row[f"TO_{a}"] = stats["TO"][a]
+            row[f"FROM_{a}"] = stats["FROM"][a]
+            row[f"NET_{a}"] = stats["NET"][a]
+        roll_rows.append(row)
+
+        # edges for this date
+        ed = out["edges"].copy()
+        ed["date"] = dt
+        edge_rows.append(ed)
+
+        if k % max(1, (len(ends) // 10)) == 0:
+            print(f"[INFO] Rolling progress: {k}/{len(ends)} windows...")
+
+    roll_df = pd.DataFrame(roll_rows).set_index("date").sort_index()
+    edges_df = pd.concat(edge_rows, axis=0, ignore_index=True) if edge_rows else pd.DataFrame(
+        columns=["src", "dst", "weight_pct", "date"]
+    )
+    return {"rolling_summary": roll_df, "rolling_edges": edges_df}
+
+
+def save_outputs(full_out: Dict[str, object],
+                 roll_out: Optional[Dict[str, object]],
+                 cfg: Config,
+                 data_window: Dict[str, str]) -> None:
+    os.makedirs(os.path.dirname(cfg.out_full_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_roll_summary_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_roll_edges_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    # Full sample
+    table: pd.DataFrame = full_out["table"]  # type: ignore
+    table.to_csv(cfg.out_full_csv)
+
+    # Rolling
+    if roll_out is not None:
+        roll_df: pd.DataFrame = roll_out["rolling_summary"]  # type: ignore
+        edges_df: pd.DataFrame = roll_out["rolling_edges"]  # type: ignore
+        roll_df.to_csv(cfg.out_roll_summary_csv)
+        edges_df.to_csv(cfg.out_roll_edges_csv, index=False)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": data_window,
+        "full_sample": {
+            "lags_used": int(full_out["lags_used"]),
+            "TCI": float(full_out["stats"]["TCI"]),
+            "NET_top_positive": sorted(full_out["stats"]["NET"].items(), key=lambda kv: kv[1], reverse=True)[:5],
+            "NET_top_negative": sorted(full_out["stats"]["NET"].items(), key=lambda kv: kv[1])[:5],
+        }
+    }
+
+    if roll_out is not None and not roll_out["rolling_summary"].empty:
+        roll_df = roll_out["rolling_summary"]
+        summary["rolling"] = {
+            "n_points": int(len(roll_df)),
+            "tci_min": float(roll_df["TCI"].min()),
+            "tci_max": float(roll_df["TCI"].max()),
+            "tci_last": float(roll_df["TCI"].iloc[-1]),
+            "date_first": str(roll_df.index.min().date()),
+            "date_last": str(roll_df.index.max().date()),
+        }
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved full connectedness table → {cfg.out_full_csv}")
+    if roll_out is not None:
+        print(f"[OK] Saved rolling summary → {cfg.out_roll_summary_csv}")
+        print(f"[OK] Saved rolling edges → {cfg.out_roll_edges_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, use_log=cfg.use_log_returns)
+    if cfg.dropna:
+        rets = rets.dropna(how="any")
+
+    # Keep same column order as cfg.symbols
+    rets = rets.loc[:, list(cfg.symbols)]
+
+    data_window = {
+        "start": str(rets.index.min().date()),
+        "end": str(rets.index.max().date()),
+        "n_returns": int(len(rets)),
+        "assets": int(rets.shape[1]),
+    }
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+    print(f"[INFO] Full-sample VAR+GFEVD: horizon={cfg.horizon}, lags={cfg.lags or 'auto('+cfg.ic+')'}")
+
+    full_out = run_full_sample(rets, cfg)
+    print(f"[OK] Full-sample TCI={full_out['stats']['TCI']:.2f} | lags_used={full_out['lags_used']}")
+
+    roll_out = None
+    if cfg.rolling:
+        if len(rets) < cfg.window + 50:
+            print("[WARN] Not enough data for rolling; skipping rolling outputs.")
+        else:
+            print(f"[INFO] Rolling connectedness: window={cfg.window}, step={cfg.step}")
+            roll_out = run_rolling(rets, cfg)
+            if not roll_out["rolling_summary"].empty:
+                print(f"[OK] Rolling computed points={len(roll_out['rolling_summary'])} "
+                      f"| last TCI={roll_out['rolling_summary']['TCI'].iloc[-1]:.2f}")
+
+    save_outputs(full_out, roll_out, cfg, data_window)
+
+    # Print quick ranking
+    net = full_out["stats"]["NET"]
+    net_sorted = sorted(net.items(), key=lambda kv: kv[1], reverse=True)
+    print("[TOP] NET transmitters (positive NET):")
+    for k, v in net_sorted[:min(5, len(net_sorted))]:
+        print(f"  {k:>5s}  NET={v:.2f}")
+    print("[TOP] NET receivers (negative NET):")
+    for k, v in net_sorted[::-1][:min(5, len(net_sorted))]:
+        print(f"  {k:>5s}  NET={v:.2f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-91: Generalized (order-invariant) connectedness via VAR + GFEVD")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--horizon", type=int, default=Config.horizon)
+    p.add_argument("--maxlags", type=int, default=Config.maxlags)
+    p.add_argument("--lags", type=int, default=None)
+    p.add_argument("--ic", type=str, default=Config.ic, choices=["aic", "bic", "hqic", "fpe"])
+
+    p.add_argument("--no-rolling", action="store_true")
+    p.add_argument("--window", type=int, default=Config.window)
+    p.add_argument("--step", type=int, default=Config.step)
+
+    p.add_argument("--no-standardize", action="store_true")
+    p.add_argument("--simple-returns", action="store_true")
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--full-csv", type=str, default=Config.out_full_csv)
+    p.add_argument("--roll-csv", type=str, default=Config.out_roll_summary_csv)
+    p.add_argument("--edges-csv", type=str, default=Config.out_roll_edges_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        horizon=int(a.horizon),
+        maxlags=int(a.maxlags),
+        lags=(int(a.lags) if a.lags is not None else None),
+        ic=str(a.ic),
+        rolling=(not a.no_rolling),
+        window=int(a.window),
+        step=int(a.step),
+        use_log_returns=(not a.simple_returns),
+        standardize=(not a.no_standardize),
+        seed=int(a.seed),
+        out_full_csv=a.full_csv,
+        out_roll_summary_csv=a.roll_csv,
+        out_roll_edges_csv=a.edges_csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### What to run (fast + stable defaults)
+
+* Full sample only (fastest):
+
+```bash
+python level91_generalized_connectedness.py --no-rolling
+```
+
+* Rolling (medium speed). If it’s slow on your machine, increase `--step`:
+
+```bash
+python level91_generalized_connectedness.py --window 756 --step 10
+```
+
+### Why this won’t have the Level-90 “ordering” issue
+
+This uses **Generalized FEVD (Pesaran–Shin)**, so the spillovers don’t depend on variable ordering.
+
+If you want, paste your **Level-90 script** and I’ll match its exact output format while swapping in GFEVD under the hood (so your file naming + columns stay identical).
