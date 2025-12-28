@@ -1,0 +1,49 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "p": 2,
+    "h": 10,
+    "ridge": 1e-10,
+    "min_obs": 800,
+    "rolling": false,
+    "window": 756,
+    "step": 21,
+    "seed": 42,
+    "out_mat_csv": "level87_spillover_matrix.csv",
+    "out_metrics_csv": "level87_spillover_metrics.csv",
+    "out_json": "level87_spillover_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020,
+    "assets": 8
+  },
+  "var": {
+    "lags": 2
+  },
+  "fevd": {
+    "horizon": 10
+  },
+  "total_spillover_percent": 59.13619271320718,
+  "ranking_net_spillover_high_to_low": [
+    "SPY",
+    "EFA",
+    "IWM",
+    "QQQ",
+    "EEM",
+    "LQD",
+    "TLT",
+    "GLD"
+  ]
+}
