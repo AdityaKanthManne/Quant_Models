@@ -1,0 +1,38 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lam": 0.97,
+    "use_log_returns": true,
+    "min_obs": 600,
+    "ridge": 1e-06,
+    "edges_topk": 40,
+    "seed": 42,
+    "out_conn_csv": "level92_dcc_connectedness.csv",
+    "out_edges_csv": "level92_dcc_edges.csv",
+    "out_json": "level92_dcc_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020,
+    "assets": 8
+  },
+  "connectedness": {
+    "n_points": 3420,
+    "tci_min": 99.99999999999997,
+    "tci_max": 100.00000000000003,
+    "tci_last": 100.0,
+    "date_first": "2012-05-22",
+    "date_last": "2025-12-26"
+  }
+}

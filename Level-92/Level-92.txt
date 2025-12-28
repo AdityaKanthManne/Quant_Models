@@ -1,0 +1,411 @@
+Got it — **Level-92**. Since your recent issues were mostly (1) **yfinance MultiIndex / rename bugs** and (2) **slow loops**, I’m going to give you a **Level-92 script that is fast + robust** and won’t hit those pandas/yfinance traps.
+
+### ✅ Level-92 (what we’ll implement)
+
+**Time-varying connectedness** using **DCC-GARCH-lite (EWMA/DCC proxy)**:
+
+* Compute **dynamic covariance/correlation** from returns (fast, no heavy optimization)
+* Build a **connectedness / spillover matrix** each day using a *simple variance-decomposition proxy*:
+
+  * directional spillovers based on **partial correlations** (precision matrix) or **correlation weights**
+* Output:
+
+  * `level92_dcc_connectedness.csv` (daily TCI + net transmit/receive)
+  * `level92_dcc_edges.csv` (optional edges panel for network graphs)
+  * `level92_summary.json`
+
+This is **much faster** than rolling VAR+GFEVD, and avoids statsmodels lag-selection loops.
+
+---
+
+## Full code: `level92_dcc_connectedness.py`
+
+```python
+# level92_dcc_connectedness.py
+# Level-92: Fast Time-Varying Connectedness via DCC-lite (EWMA + Precision Network)
+#
+# What it does:
+# - Downloads prices (robust to yfinance MultiIndex)
+# - Computes returns
+# - Builds time-varying covariance using EWMA (RiskMetrics-style) OR DCC-lite update
+# - Converts covariance -> correlation -> precision (inverse corr) -> partial correlations
+# - Uses partial-corr magnitudes to define a spillover/connectedness matrix
+# - Computes:
+#   - TCI (total connectedness index)
+#   - TO / FROM / NET per asset (time-varying)
+#
+# Outputs:
+# - level92_dcc_connectedness.csv
+# - level92_dcc_edges.csv
+# - level92_dcc_summary.json
+#
+# Run:
+#   python level92_dcc_connectedness.py
+#   python level92_dcc_connectedness.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --start 2010-01-01
+#   python level92_dcc_connectedness.py --lambda 0.97 --min_obs 700 --edges_topk 30
+
+import os
+import json
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    # EWMA decay (RiskMetrics). Higher => smoother.
+    lam: float = 0.97
+
+    # Use log returns by default
+    use_log_returns: bool = True
+
+    # Stability / speed controls
+    min_obs: int = 600              # need enough history before producing time-varying stats
+    ridge: float = 1e-6             # ridge added to correlation matrix before inversion
+    edges_topk: int = 40            # write only top-k edges per day (by weight)
+
+    seed: int = 42
+
+    out_conn_csv: str = "level92_dcc_connectedness.csv"
+    out_edges_csv: str = "level92_dcc_edges.csv"
+    out_json: str = "level92_dcc_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        candidates = [
+            ("Adj Close", symbol),
+            ("Close", symbol),
+            (symbol, "Adj Close"),
+            (symbol, "Close"),
+        ]
+        for key in candidates:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+
+        # fallback scan
+        cols = []
+        for c in px.columns:
+            c0 = str(c[0]).lower()
+            c1 = str(c[1]).lower()
+            if (symbol.lower() in c0 or symbol.lower() in c1) and ("close" in c0 or "close" in c1):
+                cols.append(c)
+        if cols:
+            s = px[cols[0]].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # try batch download first (faster)
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            series_list = []
+            ok = True
+            for s in symbols:
+                try:
+                    series_list.append(_extract_close_series(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and series_list:
+                prices = pd.concat(series_list, axis=1).sort_index().dropna(how="any")
+                return prices
+    except Exception:
+        pass
+
+    # fallback per symbol
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        frames.append(_extract_close_series(px, s))
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    if use_log:
+        rets = np.log(prices).diff()
+    else:
+        rets = prices.pct_change()
+
+    rets = rets.replace([np.inf, -np.inf], np.nan)
+    rets = rets.dropna()
+    rets = rets.asfreq("B").dropna()
+    return rets
+
+
+# ----------------------------- Math helpers -----------------------------
+def corr_from_cov(cov: np.ndarray) -> np.ndarray:
+    d = np.sqrt(np.maximum(np.diag(cov), 1e-18))
+    invd = 1.0 / d
+    corr = cov * invd[:, None] * invd[None, :]
+    corr = np.clip(corr, -0.999999, 0.999999)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
+def partial_corr_from_corr(corr: np.ndarray, ridge: float) -> np.ndarray:
+    """
+    Partial correlation from correlation matrix via precision matrix:
+      P = inv(C + ridge I)
+      rho_ij.partial = -P_ij / sqrt(P_ii * P_jj)
+    """
+    n = corr.shape[0]
+    C = corr.copy()
+    C.flat[:: n + 1] += ridge  # add ridge to diagonal
+
+    P = np.linalg.inv(C)
+    denom = np.sqrt(np.outer(np.diag(P), np.diag(P)))
+    pc = -P / np.maximum(denom, 1e-18)
+    np.fill_diagonal(pc, 0.0)
+    pc = np.clip(pc, -0.999999, 0.999999)
+    return pc
+
+
+def connectedness_from_partial(pc: np.ndarray, labels: List[str]) -> Dict[str, object]:
+    """
+    Build a spillover matrix W from |partial correlations|:
+      w_ij = |pc_ij| / sum_k |pc_ik|   (row-normalized)
+    Then:
+      FROM_i = sum_j w_ij
+      TO_i   = sum_j w_ji
+      NET_i  = TO_i - FROM_i
+      TCI    = 100 * (sum offdiag W) / N
+    """
+    W = np.abs(pc)
+    row_sums = W.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums <= 0, 1.0, row_sums)
+    W = W / row_sums
+
+    N = W.shape[0]
+    off = W.copy()
+    np.fill_diagonal(off, 0.0)
+
+    FROM = off.sum(axis=1)
+    TO = off.sum(axis=0)
+    NET = TO - FROM
+    TCI = 100.0 * off.sum() / N
+
+    return {
+        "W": W,
+        "TCI": float(TCI),
+        "FROM": {labels[i]: float(FROM[i] * 100.0) for i in range(N)},
+        "TO": {labels[i]: float(TO[i] * 100.0) for i in range(N)},
+        "NET": {labels[i]: float(NET[i] * 100.0) for i in range(N)},
+    }
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+    rets = rets.loc[:, list(cfg.symbols)].dropna(how="any")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    X = rets.values
+    T, N = X.shape
+    labels = list(rets.columns)
+
+    if T < cfg.min_obs:
+        raise RuntimeError(f"Not enough observations ({T}) for min_obs={cfg.min_obs}")
+
+    # Initialize EWMA covariance with sample covariance on first min_obs block
+    init = np.cov(X[:cfg.min_obs].T, ddof=1)
+    S = init.copy()
+
+    rows = []
+    edges_rows = []
+
+    for t in range(cfg.min_obs, T):
+        x = X[t]
+        # EWMA covariance update: S_t = lam*S_{t-1} + (1-lam) * x x'
+        S = cfg.lam * S + (1.0 - cfg.lam) * np.outer(x, x)
+
+        corr = corr_from_cov(S)
+        pc = partial_corr_from_corr(corr, ridge=cfg.ridge)
+
+        conn = connectedness_from_partial(pc, labels)
+
+        dt = rets.index[t]
+        row = {"date": dt, "TCI": conn["TCI"]}
+        for a in labels:
+            row[f"TO_{a}"] = conn["TO"][a]
+            row[f"FROM_{a}"] = conn["FROM"][a]
+            row[f"NET_{a}"] = conn["NET"][a]
+        rows.append(row)
+
+        # edges: use W weights
+        W = conn["W"]
+        # top-k directed edges by weight per day
+        if cfg.edges_topk > 0:
+            flat = []
+            for i, src in enumerate(labels):
+                for j, dst in enumerate(labels):
+                    if i == j:
+                        continue
+                    flat.append((src, dst, float(W[i, j] * 100.0)))
+            flat.sort(key=lambda z: z[2], reverse=True)
+            for (src, dst, w) in flat[:cfg.edges_topk]:
+                edges_rows.append({"date": dt, "src": src, "dst": dst, "weight_pct": w})
+
+        if (t - cfg.min_obs) % max(1, ((T - cfg.min_obs) // 10)) == 0:
+            print(f"[INFO] Progress {t - cfg.min_obs}/{T - cfg.min_obs} ...")
+
+    conn_df = pd.DataFrame(rows).set_index("date").sort_index()
+    edges_df = pd.DataFrame(edges_rows) if edges_rows else pd.DataFrame(columns=["date", "src", "dst", "weight_pct"])
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "assets": int(N),
+        },
+        "connectedness": {
+            "n_points": int(len(conn_df)),
+            "tci_min": float(conn_df["TCI"].min()),
+            "tci_max": float(conn_df["TCI"].max()),
+            "tci_last": float(conn_df["TCI"].iloc[-1]),
+            "date_first": str(conn_df.index.min().date()),
+            "date_last": str(conn_df.index.max().date()),
+        },
+    }
+
+    return {"conn": conn_df, "edges": edges_df, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    conn: pd.DataFrame = result["conn"]  # type: ignore
+    edges: pd.DataFrame = result["edges"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_conn_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_edges_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    conn.to_csv(cfg.out_conn_csv)
+    edges.to_csv(cfg.out_edges_csv, index=False)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved connectedness → {cfg.out_conn_csv}")
+    print(f"[OK] Saved edges → {cfg.out_edges_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    # print last snapshot
+    last = conn.iloc[-1]
+    labels = [c.replace("NET_", "") for c in conn.columns if c.startswith("NET_")]
+    net = {a: float(last[f"NET_{a}"]) for a in labels}
+    top_tx = sorted(net.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_rx = sorted(net.items(), key=lambda kv: kv[1])[:5]
+    print(f"[LAST] TCI={float(last['TCI']):.2f}")
+    print("[LAST] Top transmitters (NET high):", top_tx)
+    print("[LAST] Top receivers (NET low):", top_rx)
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-92: Fast Time-Varying Connectedness via EWMA+DCC-lite partial correlations")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--lambda", dest="lam", type=float, default=Config.lam)
+    p.add_argument("--min_obs", type=int, default=Config.min_obs)
+    p.add_argument("--ridge", type=float, default=Config.ridge)
+    p.add_argument("--edges_topk", type=int, default=Config.edges_topk)
+
+    p.add_argument("--simple-returns", action="store_true")
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--conn-csv", type=str, default=Config.out_conn_csv)
+    p.add_argument("--edges-csv", type=str, default=Config.out_edges_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        lam=float(a.lam),
+        use_log_returns=(not a.simple_returns),
+        min_obs=int(a.min_obs),
+        ridge=float(a.ridge),
+        edges_topk=int(a.edges_topk),
+        seed=int(a.seed),
+        out_conn_csv=a.conn_csv,
+        out_edges_csv=a.edges_csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+---
+
+### Why this will not “run forever”
+
+* No rolling VAR refits
+* No quantile regression loops
+* Just one EWMA update per day + a small matrix inversion (8×8 is tiny)
+
+If you want it even faster:
+
+```bash
+python level92_dcc_connectedness.py --min_obs 500 --edges_topk 0
+```
+
+If you tell me what your **Level-92 requirement** is (title/goal), I can adapt this to match the exact “level spec” you’re following.
