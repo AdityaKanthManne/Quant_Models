@@ -1,0 +1,572 @@
+```python
+# level100_evt_es_risk_budget.py
+# Level-100: End-to-End Risk Engine — EVT (POT-GPD) Expected Shortfall Risk Budgeting
+#            + Monthly Rebalancing + Turnover/TC + Walk-Forward Backtest (SciPy-free)
+#
+# What this does (fast, stable, no long loops):
+# 1) Download prices (yfinance) for a small ETF universe
+# 2) Compute daily returns
+# 3) Each month, estimate each asset's *tail risk* using EVT POT-GPD ES on LOSSES:
+#       loss = -return  (right tail = big losses)
+#       threshold u = quantile(loss, q_u)
+#       exceed = loss-u | loss>u
+#       Fit GPD params (xi, beta) with Method-of-Moments (very fast, no optimizers)
+#       ES_loss(alpha) from POT formula
+#    If exceedances are too few, fallback to empirical ES (mean of worst alpha losses).
+# 4) Build risk-budget weights:
+#       w_i ∝ 1 / ES_loss_i
+#    with caps/floors and optional correlation shrink (lightweight)
+# 5) Hold weights until next rebalance date; subtract transaction costs at rebalances
+# 6) Save daily series + metrics JSON
+#
+# Outputs:
+#   - level100_evt_es_rb_daily.csv
+#   - level100_evt_es_rb_weights.csv
+#   - level100_evt_es_rb_summary.json
+#
+# Run:
+#   python level100_evt_es_risk_budget.py
+#   python level100_evt_es_risk_budget.py --alpha 0.01 --q_u 0.95 --window 1260 --rebalance ME
+#   python level100_evt_es_risk_budget.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --tc_bps 2.0
+#
+# Notes:
+# - Uses pandas resample("ME") to avoid the deprecated "M" warning.
+# - Avoids SciPy/statsmodels/cvxpy. Uses only numpy/pandas/yfinance.
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    use_log_returns: bool = True
+    dropna: bool = True
+
+    # EVT tail settings (on losses)
+    alpha: float = 0.05          # tail probability (ES at alpha)
+    q_u: float = 0.90            # threshold quantile for POT on losses (0.90 to 0.95 common)
+    window: int = 1000           # rolling window length (trading days)
+    min_exc: int = 40            # minimum exceedances required for POT fit
+    xi_clip: Tuple[float, float] = (-0.45, 0.45)  # stabilize MoM
+
+    # Rebalancing
+    rebalance: str = "ME"        # pandas offset alias, use "ME" (month-end), "W-FRI", etc.
+    max_w: float = 0.35          # per-asset cap
+    min_w: float = 0.00          # per-asset floor (0 for long-only)
+    allow_cash: bool = False     # if True, residual weight goes to CASH (0% return)
+    cash_symbol: str = "CASH"
+
+    # Simple correlation-aware scaling (optional)
+    use_corr_scale: bool = True
+    corr_shrink: float = 0.15    # shrink corr toward identity to reduce noise
+
+    # Transaction costs
+    tc_bps: float = 1.0          # cost per 100% turnover at rebalance (bps)
+                                 # cost applied: cost = tc_bps/1e4 * turnover
+
+    seed: int = 42
+
+    out_daily_csv: str = "level100_evt_es_rb_daily.csv"
+    out_weights_csv: str = "level100_evt_es_rb_weights.csv"
+    out_json: str = "level100_evt_es_rb_summary.json"
+
+
+# ----------------------------- yfinance loader (robust) -----------------------------
+def _extract_close(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        # yfinance often returns (PriceField, Symbol)
+        for key in [("Adj Close", symbol), ("Close", symbol), (symbol, "Adj Close"), (symbol, "Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    syms = tuple(symbols)
+
+    # Try batch first (faster)
+    try:
+        px_all = yf.download(list(syms), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            series = []
+            ok = True
+            for s in syms:
+                try:
+                    series.append(_extract_close(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and series:
+                return pd.concat(series, axis=1).sort_index()
+    except Exception:
+        pass
+
+    # Fallback single download per ticker
+    series = []
+    for s in syms:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        series.append(_extract_close(px, s))
+    return pd.concat(series, axis=1).sort_index()
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+    rets = (np.log(prices).diff() if use_log else prices.pct_change())
+    rets = rets.replace([np.inf, -np.inf], np.nan)
+    return rets.dropna(how="all")
+
+
+# ----------------------------- EVT POT-GPD (fast MoM) -----------------------------
+def gpd_mom_fit(exceed: np.ndarray, xi_clip: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    Method-of-moments fit for GPD on exceedances y>0.
+      mean = beta/(1-xi)
+      var  = beta^2/((1-xi)^2*(1-2xi))
+    => var/mean^2 = 1/(1-2xi)  => xi = 0.5*(1 - mean^2/var)
+       beta = mean*(1-xi)
+    """
+    y = exceed.astype(float)
+    m = float(y.mean())
+    v = float(y.var(ddof=1)) if y.size >= 2 else float(y.var())
+    v = max(v, 1e-12)
+
+    xi = 0.5 * (1.0 - (m * m) / v)
+    xi = float(np.clip(xi, xi_clip[0], xi_clip[1]))
+
+    beta = m * (1.0 - xi)
+    beta = float(max(beta, 1e-12))
+    return xi, beta
+
+
+def pot_es_loss(losses: np.ndarray, alpha: float, q_u: float, min_exc: int, xi_clip: Tuple[float, float]) -> Dict[str, float]:
+    """
+    Estimate ES on losses using POT-GPD. Returns dict with:
+      es_loss, var_loss, u, k, method (pot/empirical)
+    If exceedances insufficient or alpha not in tail beyond u, fall back to empirical ES.
+    """
+    L = losses.astype(float)
+    L = L[np.isfinite(L)]
+    n = int(L.size)
+    if n < 10:
+        return {"es_loss": float("nan"), "var_loss": float("nan"), "u": float("nan"), "k": 0.0, "method": "na"}
+
+    # POT threshold
+    u = float(np.quantile(L, q_u))
+    exc = L[L > u] - u
+    k = int(exc.size)
+
+    # Empirical ES (always available if enough points)
+    q_alpha = float(np.quantile(L, 1.0 - alpha))  # alpha tail on losses is right tail => quantile at 1-alpha
+    tail = L[L >= q_alpha]
+    emp_es = float(tail.mean()) if tail.size > 0 else float("nan")
+    emp_var = q_alpha
+
+    if k < min_exc:
+        return {"es_loss": emp_es, "var_loss": emp_var, "u": u, "k": float(k), "method": "empirical"}
+
+    p_u = k / n  # P(L>u)
+    if alpha >= p_u:
+        # desired tail prob not beyond threshold region
+        return {"es_loss": emp_es, "var_loss": emp_var, "u": u, "k": float(k), "method": "empirical"}
+
+    xi, beta = gpd_mom_fit(exc, xi_clip=xi_clip)
+
+    # VaR for losses where P(L>VaR)=alpha
+    if abs(xi) < 1e-8:
+        varL = u + beta * math.log(p_u / alpha)
+    else:
+        varL = u + (beta / xi) * (((alpha / p_u) ** (-xi)) - 1.0)
+
+    # ES for losses
+    if xi >= 0.999:
+        esL = emp_es
+        method = "empirical"
+    else:
+        yq = varL - u
+        esL = varL + (beta + xi * yq) / (1.0 - xi)
+        method = "pot"
+
+    return {"es_loss": float(esL), "var_loss": float(varL), "u": u, "k": float(k), "method": method}
+
+
+# ----------------------------- Portfolio mechanics -----------------------------
+def shrink_corr(corr: np.ndarray, shrink: float) -> np.ndarray:
+    n = corr.shape[0]
+    I = np.eye(n)
+    s = float(np.clip(shrink, 0.0, 1.0))
+    out = (1.0 - s) * corr + s * I
+    # clamp diagonal
+    np.fill_diagonal(out, 1.0)
+    return out
+
+
+def corr_scale_for_weights(w: np.ndarray, corr: np.ndarray) -> float:
+    """
+    Simple scalar that penalizes highly correlated portfolios.
+    scale = 1/sqrt(w' C w) where C is correlation. Keeps weights direction,
+    just reduces exposure when correlation concentrates risk.
+    """
+    v = float(w @ corr @ w)
+    v = max(v, 1e-12)
+    return 1.0 / math.sqrt(v)
+
+
+def clip_and_renorm(w: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    w = np.clip(w, lo, hi)
+    s = float(w.sum())
+    if s <= 0:
+        return np.ones_like(w) / len(w)
+    return w / s
+
+
+def perf_stats(r: np.ndarray) -> Dict[str, float]:
+    r = r[np.isfinite(r)]
+    if r.size == 0:
+        return {"ann_ret": float("nan"), "ann_vol": float("nan"), "sharpe": float("nan"), "max_dd": float("nan")}
+    ann_ret = float(r.mean() * 252.0)
+    ann_vol = float(r.std(ddof=1) * math.sqrt(252.0))
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else float("nan")
+    eq = np.cumprod(1.0 + r)
+    peak = np.maximum.accumulate(eq)
+    dd = (eq / peak) - 1.0
+    max_dd = float(dd.min()) if dd.size else float("nan")
+    return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe, "max_dd": max_dd}
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+
+    if cfg.dropna:
+        rets = rets.dropna(how="any")
+    if rets.empty:
+        raise RuntimeError("No returns after cleaning (check tickers/start).")
+
+    dates = rets.index
+    n, m = rets.shape
+    if n <= cfg.window + 5:
+        raise RuntimeError(f"Not enough rows for window={cfg.window}. rows={n}")
+
+    # Rebalance dates (month-end, etc.)
+    # Using "ME" avoids the deprecated "M".
+    rebal_dates = rets.resample(cfg.rebalance).last().index
+    rebal_dates = rebal_dates[rebal_dates >= dates[cfg.window]]
+
+    print(f"[INFO] rows={n}, assets={m}, rebalances={len(rebal_dates)} ({cfg.rebalance}), window={cfg.window}")
+    print(f"[INFO] EVT alpha={cfg.alpha}, q_u={cfg.q_u}, min_exc={cfg.min_exc}, tc_bps={cfg.tc_bps}")
+
+    # Storage
+    w_hist = pd.DataFrame(index=rebal_dates, columns=list(cfg.symbols), dtype=float)
+    es_hist = pd.DataFrame(index=rebal_dates, columns=[f"ESloss_{s}" for s in cfg.symbols], dtype=float)
+    method_hist = pd.DataFrame(index=rebal_dates, columns=[f"method_{s}" for s in cfg.symbols], dtype=str)
+    exc_hist = pd.DataFrame(index=rebal_dates, columns=[f"k_{s}" for s in cfg.symbols], dtype=float)
+
+    # Daily holdings
+    w_daily = pd.DataFrame(index=dates, columns=list(cfg.symbols), dtype=float)
+
+    prev_w = np.zeros(m, dtype=float)
+    prev_w[:] = 1.0 / m  # start equal-weight
+
+    rets_np = rets.values
+
+    for dt in rebal_dates:
+        t = int(np.searchsorted(dates.values, dt.to_datetime64()))
+        if t <= cfg.window:
+            continue
+        win = rets_np[t - cfg.window:t, :]  # window x assets
+
+        # Losses per asset
+        losses = -win  # right tail
+
+        es = np.full(m, np.nan, dtype=float)
+        for j, s in enumerate(cfg.symbols):
+            res = pot_es_loss(
+                losses=losses[:, j],
+                alpha=cfg.alpha,
+                q_u=cfg.q_u,
+                min_exc=cfg.min_exc,
+                xi_clip=cfg.xi_clip,
+            )
+            es[j] = res["es_loss"]
+            es_hist.loc[dt, f"ESloss_{s}"] = res["es_loss"]
+            method_hist.loc[dt, f"method_{s}"] = res["method"]
+            exc_hist.loc[dt, f"k_{s}"] = res["k"]
+
+        # Risk budgeting: w ∝ 1/ES_loss  (ES_loss is positive-ish)
+        es_safe = np.where(np.isfinite(es) & (es > 1e-12), es, np.nan)
+        if np.all(~np.isfinite(es_safe)):
+            raw = np.ones(m) / m
+        else:
+            inv = 1.0 / np.where(np.isfinite(es_safe), es_safe, np.nan)
+            inv = np.where(np.isfinite(inv), inv, 0.0)
+            if inv.sum() <= 0:
+                raw = np.ones(m) / m
+            else:
+                raw = inv / inv.sum()
+
+        # Cap/floor
+        w = clip_and_renorm(raw, cfg.min_w, cfg.max_w)
+
+        # Optional corr-based scale (scalar, keeps weights long-only and fast)
+        if cfg.use_corr_scale:
+            C = np.corrcoef(win, rowvar=False)
+            C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+            C = shrink_corr(C, cfg.corr_shrink)
+            scale = corr_scale_for_weights(w, C)
+            # We keep weights normalized (sum=1) for long-only.
+            # Scale is reported (can be used if you later add leverage targeting).
+            # For now we just store it in weights file as 'leverage_hint'.
+            leverage_hint = float(scale)
+        else:
+            leverage_hint = float("nan")
+
+        # Save rebalance weights + hint
+        w_hist.loc[dt, :] = w
+        w_hist.loc[dt, :] = w_hist.loc[dt, :].astype(float)
+
+        # Assign weights forward until next rebalance date
+        # We'll fill daily after loop using merge-asof style
+        # but easiest: mark only at dt; later forward-fill.
+        w_daily.loc[dt, :] = w
+
+        prev_w = w
+
+    # Forward-fill daily weights; then backfill initial portion with first available weights
+    w_daily = w_daily.sort_index().ffill()
+    first_valid = w_daily.dropna(how="any").index.min()
+    if first_valid is None:
+        raise RuntimeError("No rebalances produced weights (try smaller window or different rebalance freq).")
+    w_daily.loc[:first_valid, :] = w_daily.loc[first_valid, :].values
+
+    # Compute daily portfolio returns with transaction costs at rebalance points
+    port = np.sum(rets_np * w_daily.values, axis=1)
+
+    # Turnover at rebalance dates (L1)
+    rebal_mask = np.zeros(n, dtype=bool)
+    rebal_mask[np.searchsorted(dates.values, rebal_dates.to_datetime64())] = True
+    # Compute turnover on those dates using change in weights from previous day
+    w_vals = w_daily.values
+    w_prev = np.vstack([w_vals[0:1, :], w_vals[:-1, :]])
+    turnover = np.sum(np.abs(w_vals - w_prev), axis=1)
+
+    tc = (cfg.tc_bps / 1e4) * turnover * rebal_mask.astype(float)
+    port_net = port - tc
+
+    # Build output daily df
+    daily = pd.DataFrame(index=dates)
+    daily["port_ret_gross"] = port
+    daily["port_ret_net"] = port_net
+    daily["turnover"] = turnover
+    daily["tc_cost"] = tc
+    for j, s in enumerate(cfg.symbols):
+        daily[f"w_{s}"] = w_daily.iloc[:, j].values
+        daily[f"ret_{s}"] = rets.iloc[:, j].values
+
+    # Summary stats
+    stats_gross = perf_stats(daily["port_ret_gross"].values)
+    stats_net = perf_stats(daily["port_ret_net"].values)
+
+    avg_turn = float(np.mean(turnover[rebal_mask])) if rebal_mask.any() else float("nan")
+    med_turn = float(np.median(turnover[rebal_mask])) if rebal_mask.any() else float("nan")
+
+    # Basic VaR exceptions check using rolling empirical VaR of portfolio net (quick sanity)
+    # (This is not the EVT VaR; just a quick backtest metric.)
+    r_net = daily["port_ret_net"].values
+    var_roll = np.full(n, np.nan)
+    for t in range(cfg.window, n):
+        winp = r_net[t - cfg.window:t]
+        var_roll[t] = float(np.quantile(winp, cfg.alpha))
+    exc = np.isfinite(var_roll) & (r_net <= var_roll)
+    exc_rate = float(exc.sum() / np.isfinite(var_roll).sum()) if np.isfinite(var_roll).sum() > 0 else float("nan")
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {"start": str(dates.min().date()), "end": str(dates.max().date()), "n_returns": int(n)},
+        "rebalancing": {"freq": cfg.rebalance, "n_rebalances": int(len(rebal_dates))},
+        "performance_gross": stats_gross,
+        "performance_net": stats_net,
+        "turnover": {"avg_rebalance_turnover_L1": avg_turn, "median_rebalance_turnover_L1": med_turn},
+        "quick_var_backtest": {
+            "alpha": float(cfg.alpha),
+            "exception_rate_vs_empirical_rolling_var": exc_rate,
+            "note": "This is a quick sanity check using rolling empirical VaR on portfolio net returns."
+        },
+        "notes": [
+            "Weights are long-only and sum to 1 (no leverage).",
+            "Tail-risk model uses EVT POT-GPD ES on losses per asset; falls back to empirical ES when exceedances are too few.",
+            "This is designed to be fast and avoid long numerical loops or SciPy dependencies."
+        ]
+    }
+
+    # Add leverage hints as a separate column in weights output (optional diagnostics)
+    w_out = w_hist.copy()
+    w_out["leverage_hint"] = np.nan
+    if cfg.use_corr_scale:
+        for dt in w_out.index:
+            t = int(np.searchsorted(dates.values, dt.to_datetime64()))
+            win = rets_np[t - cfg.window:t, :]
+            C = np.corrcoef(win, rowvar=False)
+            C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+            C = shrink_corr(C, cfg.corr_shrink)
+            w = w_out.loc[dt, list(cfg.symbols)].values.astype(float)
+            w_out.loc[dt, "leverage_hint"] = corr_scale_for_weights(w, C)
+
+    return {
+        "daily": daily,
+        "weights": w_out,
+        "es": es_hist,
+        "methods": method_hist,
+        "exceed": exc_hist,
+        "summary": summary,
+    }
+
+
+def save_outputs(res: Dict[str, object], cfg: Config) -> None:
+    daily: pd.DataFrame = res["daily"]  # type: ignore
+    weights: pd.DataFrame = res["weights"]  # type: ignore
+    es: pd.DataFrame = res["es"]  # type: ignore
+    methods: pd.DataFrame = res["methods"]  # type: ignore
+    exceed: pd.DataFrame = res["exceed"]  # type: ignore
+    summary: Dict = res["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_daily_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_weights_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    daily.to_csv(cfg.out_daily_csv)
+    # Bundle weights + diagnostics in one CSV
+    weights_out = pd.concat([weights, es, exceed, methods], axis=1)
+    weights_out.to_csv(cfg.out_weights_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily → {cfg.out_daily_csv}")
+    print(f"[OK] Saved weights/EVT diagnostics → {cfg.out_weights_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    pg = summary["performance_gross"]
+    pn = summary["performance_net"]
+    print(f"[PERF gross] AnnRet={pg['ann_ret']:.2%} AnnVol={pg['ann_vol']:.2%} Sharpe={pg['sharpe']:.2f} MaxDD={pg['max_dd']:.2%}")
+    print(f"[PERF net  ] AnnRet={pn['ann_ret']:.2%} AnnVol={pn['ann_vol']:.2%} Sharpe={pn['sharpe']:.2f} MaxDD={pn['max_dd']:.2%}")
+    t = summary["turnover"]
+    print(f"[TURN] Avg L1 turnover/rebal={t['avg_rebalance_turnover_L1']:.3f}  Median={t['median_rebalance_turnover_L1']:.3f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-100: EVT ES Risk Budgeting (POT-GPD) + Monthly Rebalance + TC")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--q_u", type=float, default=Config.q_u)
+    p.add_argument("--window", type=int, default=Config.window)
+    p.add_argument("--min-exc", dest="min_exc", type=int, default=Config.min_exc)
+
+    p.add_argument("--rebalance", type=str, default=Config.rebalance)  # use ME not M
+    p.add_argument("--max-w", dest="max_w", type=float, default=Config.max_w)
+    p.add_argument("--min-w", dest="min_w", type=float, default=Config.min_w)
+
+    p.add_argument("--no-corr-scale", action="store_true")
+    p.add_argument("--corr-shrink", type=float, default=Config.corr_shrink)
+
+    p.add_argument("--tc_bps", type=float, default=Config.tc_bps)
+
+    p.add_argument("--simple-returns", action="store_true")
+    p.add_argument("--no-dropna", action="store_true")
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--daily-csv", type=str, default=Config.out_daily_csv)
+    p.add_argument("--weights-csv", type=str, default=Config.out_weights_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        alpha=float(a.alpha),
+        q_u=float(a.q_u),
+        window=int(a.window),
+        min_exc=int(a.min_exc),
+        rebalance=str(a.rebalance),
+        max_w=float(a.max_w),
+        min_w=float(a.min_w),
+        use_corr_scale=(not a.no_corr_scale),
+        corr_shrink=float(a.corr_shrink),
+        tc_bps=float(a.tc_bps),
+        use_log_returns=(not a.simple_returns),
+        dropna=(not a.no_dropna),
+        seed=int(a.seed),
+        out_daily_csv=a.daily_csv,
+        out_weights_csv=a.weights_csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    res = run_pipeline(cfg)
+    save_outputs(res, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### If you want it to run even faster
+
+Use **fewer rebalances** and a smaller window:
+
+```bash
+python level100_evt_es_risk_budget.py --rebalance 2ME --window 756 --q_u 0.90
+```
+
+### If you want “hard tail” behavior (more crisis-sensitive)
+
+```bash
+python level100_evt_es_risk_budget.py --alpha 0.01 --q_u 0.95 --window 1260 --min-exc 50
+```
+
+If you paste your Level-100 definition from your roadmap (one line), I can align the **exact outputs/metrics** (e.g., add CoVaR constraints, leverage targeting, drawdown control, or regime switching) while keeping it **fast + SciPy-free**.
