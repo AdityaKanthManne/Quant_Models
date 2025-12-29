@@ -1,0 +1,506 @@
+Level-94 — let’s do **SRISK (Capital Shortfall)** using the **LRMES proxy** from Level-93 (fast, no heavy loops, same free-data stack).
+
+### What this script computes
+
+For each symbol (typically **banks/financials**, but it will run on ETFs too if market cap is available):
+
+* **MES(α)** (expanding, conditioned on market tail)
+* **LRMES proxy** from MES (bounded)
+* **Market Cap** (from `yfinance.Ticker().fast_info / info`)
+* **Debt proxy**:
+
+  * If `totalDebt` is available → use it
+  * Else use a **leverage assumption** `L` (default 5.0): `Debt = (L-1)*Equity`
+* **SRISK (capital shortfall)**:
+  [
+  SRISK = \max\left(0,; k(D+E) - (1-LRMES)E\right)
+  ]
+  where `k` is capital ratio (default 0.08), `D` debt, `E` equity market value.
+
+Outputs:
+
+* `level94_srisk_daily.csv`
+* `level94_srisk_summary.json`
+
+---
+
+## ✅ Full code: `level94_srisk_capital_shortfall.py`
+
+```python
+# level94_srisk_capital_shortfall.py
+# Level-94: SRISK (Capital Shortfall) using LRMES proxy (fast, free data)
+#
+# SRISK_i(t) = max(0, k*(D_i + E_i) - (1 - LRMES_i(t))*E_i )
+# - k: capital ratio (e.g., 8%)
+# - E_i: equity market value (market cap)
+# - D_i: debt (from yfinance totalDebt if available; else proxy via leverage L)
+# - LRMES_i(t): proxy computed from MES(t): LRMES = 1 - exp(horizon_weeks * MES)
+#
+# Outputs:
+#   - level94_srisk_daily.csv
+#   - level94_srisk_summary.json
+#
+# Run:
+#   python level94_srisk_capital_shortfall.py
+#   python level94_srisk_capital_shortfall.py --market SPY --symbols JPM BAC GS MS AAPL
+#   python level94_srisk_capital_shortfall.py --alpha 0.01 --lam 0.97 --k 0.08 --leverage 6
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("JPM", "BAC", "GS", "MS", "WFC")
+    market: str = "SPY"
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05          # market tail quantile for MES conditioning
+    lam: float = 0.97            # EWMA decay for beta/cov (optional output)
+    use_log_returns: bool = True
+
+    min_obs: int = 600           # minimum history before time series is emitted
+
+    # SRISK parameters
+    k: float = 0.08              # target capital ratio
+    leverage: float = 5.0        # used if totalDebt not available: D = (L-1)*E
+
+    # LRMES proxy
+    lrmes_horizon_weeks: int = 18
+    lrmes_cap: float = 0.999
+
+    # speed knobs
+    q_update_every: int = 20      # update market tail threshold every K steps (expanding)
+    min_tail_obs: int = 10        # require tail obs before MES(t) becomes valid
+
+    seed: int = 42
+
+    out_csv: str = "level94_srisk_daily.csv"
+    out_json: str = "level94_srisk_summary.json"
+
+
+# ----------------------------- Robust yfinance loaders -----------------------------
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        candidates = [
+            ("Adj Close", symbol),
+            ("Close", symbol),
+            (symbol, "Adj Close"),
+            (symbol, "Close"),
+        ]
+        for key in candidates:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+
+        # fallback scan
+        cols = []
+        for c in px.columns:
+            c0 = str(c[0]).lower()
+            c1 = str(c[1]).lower()
+            if (symbol.lower() in c0 or symbol.lower() in c1) and ("close" in c0 or "close" in c1):
+                cols.append(c)
+        if cols:
+            s = px[cols[0]].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # batch download first (faster)
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            ss = []
+            ok = True
+            for s in symbols:
+                try:
+                    ss.append(_extract_close_series(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and ss:
+                return pd.concat(ss, axis=1).sort_index().dropna(how="any")
+    except Exception:
+        pass
+
+    # fallback per symbol
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        frames.append(_extract_close_series(px, s))
+    return pd.concat(frames, axis=1).sort_index().dropna(how="any")
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    if use_log:
+        rets = np.log(prices).diff()
+    else:
+        rets = prices.pct_change()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    rets = rets.asfreq("B").dropna()  # helps align business days
+    return rets
+
+
+def safe_market_cap_and_debt(symbol: str) -> Dict[str, Optional[float]]:
+    """
+    Best-effort:
+      - market cap: fast_info.market_cap -> info.marketCap
+      - total debt: info.totalDebt (often available for equities)
+    """
+    t = yf.Ticker(symbol)
+
+    mcap = None
+    debt = None
+
+    # market cap via fast_info first (faster)
+    try:
+        fi = getattr(t, "fast_info", None)
+        if fi is not None:
+            val = fi.get("market_cap", None) if isinstance(fi, dict) else getattr(fi, "market_cap", None)
+            if val is not None and np.isfinite(val):
+                mcap = float(val)
+    except Exception:
+        pass
+
+    # fallback to info
+    try:
+        info = t.info or {}
+        if mcap is None and info.get("marketCap") is not None:
+            val = info.get("marketCap")
+            if val is not None and np.isfinite(val):
+                mcap = float(val)
+        if info.get("totalDebt") is not None:
+            val = info.get("totalDebt")
+            if val is not None and np.isfinite(val):
+                debt = float(val)
+    except Exception:
+        pass
+
+    return {"market_cap": mcap, "total_debt": debt}
+
+
+# ----------------------------- MES / LRMES / SRISK -----------------------------
+def lrmes_proxy_from_mes(mes: float, horizon_weeks: int, cap: float) -> float:
+    if not np.isfinite(mes):
+        return float("nan")
+    lr = 1.0 - float(np.exp(horizon_weeks * mes))  # mes usually negative in tail => lr > 0
+    return float(np.clip(lr, 0.0, cap))
+
+
+def compute_expanding_mes_series(
+    rm: np.ndarray,
+    ri: np.ndarray,
+    alpha: float,
+    min_obs: int,
+    q_update_every: int,
+    min_tail_obs: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Fast expanding MES(t) = mean(ri up to t where rm <= q_m(t,alpha))
+    q_m updated every K days for speed.
+    """
+    T = len(rm)
+    q_m = np.full(T, np.nan, dtype=float)
+
+    for t in range(min_obs, T):
+        if t == min_obs or (t % q_update_every == 0):
+            q_m[t] = float(np.quantile(rm[: t + 1], alpha))
+        else:
+            q_m[t] = q_m[t - 1]
+
+    tail = rm <= q_m
+    tail[:min_obs] = False
+
+    tail_counts = np.cumsum(tail.astype(int))
+    tail_sums = np.cumsum(ri * tail.astype(float))
+
+    mes_t = np.full(T, np.nan, dtype=float)
+    valid = tail_counts >= min_tail_obs
+    mes_t[valid] = tail_sums[valid] / tail_counts[valid]
+
+    return {"q_m": q_m, "mes_t": mes_t, "tail_counts": tail_counts}
+
+
+def srisk_series(
+    E: float,
+    D: float,
+    lrmes_t: np.ndarray,
+    k: float,
+) -> np.ndarray:
+    """
+    SRISK(t) = max(0, k(D+E) - (1 - LRMES(t))*E)
+    """
+    if not np.isfinite(E) or E <= 0:
+        return np.full_like(lrmes_t, np.nan, dtype=float)
+    if not np.isfinite(D) or D < 0:
+        D = 0.0
+
+    cs = k * (D + E) - (1.0 - lrmes_t) * E
+    cs = np.where(np.isfinite(cs), cs, np.nan)
+    return np.maximum(cs, 0.0)
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    # Ensure market included
+    all_syms = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.market]))
+
+    print(f"[INFO] Downloading prices for {all_syms} from {cfg.start} ...")
+    prices = load_prices(all_syms, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+
+    keep_cols = [c for c in all_syms if c in rets.columns]
+    rets = rets[keep_cols].dropna(how="any")
+
+    if cfg.market not in rets.columns:
+        raise RuntimeError(f"Market '{cfg.market}' missing from returns columns.")
+
+    if len(rets) < cfg.min_obs:
+        raise RuntimeError(f"Not enough return rows ({len(rets)}) for min_obs={cfg.min_obs}")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    idx = rets.index
+    rm = rets[cfg.market].values
+
+    rows = []
+    per_asset_summary = {}
+
+    # Pull market cap / debt (once per symbol)
+    fundamentals = {}
+    print("[INFO] Fetching market cap / debt (best-effort) ...")
+    for sym in cfg.symbols:
+        if sym == cfg.market:
+            continue
+        fundamentals[sym] = safe_market_cap_and_debt(sym)
+
+    for sym in cfg.symbols:
+        if sym == cfg.market or sym not in rets.columns:
+            continue
+
+        ri = rets[sym].values
+
+        # expanding MES(t)
+        mes_pack = compute_expanding_mes_series(
+            rm=rm,
+            ri=ri,
+            alpha=cfg.alpha,
+            min_obs=cfg.min_obs,
+            q_update_every=cfg.q_update_every,
+            min_tail_obs=cfg.min_tail_obs,
+        )
+        mes_t = mes_pack["mes_t"]
+        q_m = mes_pack["q_m"]
+
+        lrmes_t = np.array([lrmes_proxy_from_mes(m, cfg.lrmes_horizon_weeks, cfg.lrmes_cap) for m in mes_t], dtype=float)
+
+        # equity market value E and debt D
+        mcap = fundamentals[sym].get("market_cap")
+        debt = fundamentals[sym].get("total_debt")
+
+        # If debt missing, proxy using leverage * equity
+        if mcap is not None and np.isfinite(mcap):
+            E = float(mcap)
+            if debt is None or not np.isfinite(debt):
+                D = float(max(cfg.leverage - 1.0, 0.0) * E)
+                debt_source = f"proxy_leverage_{cfg.leverage:.2f}"
+            else:
+                D = float(debt)
+                debt_source = "yfinance_totalDebt"
+        else:
+            # Without market cap SRISK cannot be computed
+            E = float("nan")
+            D = float("nan")
+            debt_source = "missing_market_cap"
+
+        srisk_t = srisk_series(E=E, D=D, lrmes_t=lrmes_t, k=cfg.k)
+
+        # Emit daily rows
+        for t in range(cfg.min_obs, len(idx)):
+            rows.append({
+                "date": idx[t],
+                "symbol": sym,
+                "MES_expanding": float(mes_t[t]) if np.isfinite(mes_t[t]) else np.nan,
+                "LRMES_proxy": float(lrmes_t[t]) if np.isfinite(lrmes_t[t]) else np.nan,
+                "market_tail_q": float(q_m[t]) if np.isfinite(q_m[t]) else np.nan,
+                "market_cap_E": float(E) if np.isfinite(E) else np.nan,
+                "debt_D": float(D) if np.isfinite(D) else np.nan,
+                "debt_source": debt_source,
+                "SRISK": float(srisk_t[t]) if np.isfinite(srisk_t[t]) else np.nan,
+            })
+
+        # Summary stats
+        last_srisk = srisk_t[np.isfinite(srisk_t)]
+        last_srisk_val = float(last_srisk[-1]) if last_srisk.size else None
+
+        per_asset_summary[sym] = {
+            "market_cap_E": float(E) if np.isfinite(E) else None,
+            "debt_D": float(D) if np.isfinite(D) else None,
+            "debt_source": debt_source,
+            "MES_last": float(mes_t[-1]) if np.isfinite(mes_t[-1]) else None,
+            "LRMES_last": float(lrmes_t[-1]) if np.isfinite(lrmes_t[-1]) else None,
+            "SRISK_last": last_srisk_val,
+        }
+
+    daily = pd.DataFrame(rows).sort_values(["date", "symbol"])
+    if daily.empty:
+        raise RuntimeError("No SRISK rows produced. Try equities (banks) instead of ETFs, or check yfinance access.")
+
+    # Rank latest SRISK (largest capital shortfall first)
+    last_date = daily["date"].max()
+    snap = daily[daily["date"] == last_date].copy()
+    snap = snap[np.isfinite(snap["SRISK"].values)]
+    rank = snap.sort_values("SRISK", ascending=False)["symbol"].tolist()
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "market": {"symbol": cfg.market, "alpha": float(cfg.alpha)},
+        "ranking_by_latest_SISK_desc": rank,
+        "assets": per_asset_summary,
+        "notes": [
+            "SRISK depends on market cap and debt. If market cap is missing, SRISK will be NaN.",
+            "Debt uses yfinance totalDebt when available; otherwise uses a leverage proxy D=(L-1)*E.",
+            "LRMES is a proxy from MES: LRMES=1-exp(horizon_weeks*MES), bounded.",
+        ],
+    }
+
+    return {"daily": daily, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    daily: pd.DataFrame = result["daily"]  # type: ignore
+    summary: Dict = result["summary"]      # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    daily.to_csv(cfg.out_csv, index=False)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    last_date = daily["date"].max()
+    snap = daily[daily["date"] == last_date].copy()
+    snap = snap[np.isfinite(snap["SRISK"].values)].sort_values("SRISK", ascending=False)
+    print(f"[LAST] Date={pd.to_datetime(last_date).date()}  (sorted by SRISK desc)")
+    for _, r in snap.head(min(10, len(snap))).iterrows():
+        print(f"  {r['symbol']:>6s}  SRISK={r['SRISK']:.0f}  LRMES={r['LRMES_proxy']:.3f}  E={r['market_cap_E']:.0f}  D={r['debt_D']:.0f} ({r['debt_source']})")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-94: SRISK (Capital Shortfall) using LRMES proxy")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--market", type=str, default=Config.market)
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--lam", type=float, default=Config.lam)
+    p.add_argument("--min_obs", type=int, default=Config.min_obs)
+
+    p.add_argument("--k", type=float, default=Config.k)
+    p.add_argument("--leverage", type=float, default=Config.leverage)
+    p.add_argument("--lrmes-horizon-weeks", type=int, default=Config.lrmes_horizon_weeks)
+
+    p.add_argument("--simple-returns", action="store_true")
+
+    p.add_argument("--q-update-every", type=int, default=Config.q_update_every)
+    p.add_argument("--min-tail-obs", type=int, default=Config.min_tail_obs)
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        market=a.market,
+        start=a.start,
+        alpha=float(a.alpha),
+        lam=float(a.lam),
+        use_log_returns=(not a.simple_returns),
+        min_obs=int(a.min_obs),
+        k=float(a.k),
+        leverage=float(a.leverage),
+        lrmes_horizon_weeks=int(a.lrmes_horizon_weeks),
+        q_update_every=int(a.q_update_every),
+        min_tail_obs=int(a.min_tail_obs),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+---
+
+## Notes (so you don’t get “runs forever”)
+
+* The only “loop” is **linear over time** (expanding metrics), and quantiles are updated every `--q-update-every 20` days.
+* If you want it even faster:
+
+```bash
+python level94_srisk_capital_shortfall.py --start 2015-01-01 --min_obs 450 --q-update-every 30
+```
+
+---
+
+If your Level-94 definition is **not SRISK** (some courses use Level-94 as another spillover model), paste the exact Level-94 prompt and I’ll rewrite it to match that spec exactly.

@@ -1,0 +1,428 @@
+Level-96 — let’s go one notch more “risk-desk / quant-research” than Level-95:
+
+## ✅ Level-96: Monte Carlo VaR & ES with **t-Copula** (fast, no SciPy required)
+
+This script:
+
+* pulls free data via `yfinance`
+* estimates **t-copula dependence** (no slow numeric integration, no custom PPF loops)
+* simulates correlated returns using **Gaussian-copula approximation + t marginal scaling**
+* computes **MC VaR / ES**
+* optional: compare vs Historical VaR/ES
+* avoids the “runs forever” issue by:
+
+  * vectorized simulation
+  * no per-element CDF/PPF loops
+  * no `trapz/trapezoid` integration
+  * no heavy calibration loops (grid is small + fast scoring)
+
+Outputs:
+
+* `level96_mc_tcopula_var_es.csv`
+* `level96_mc_tcopula_var_es_summary.json`
+
+---
+
+# ✅ Full code: `level96_mc_tcopula_var_es.py`
+
+```python
+# level96_mc_tcopula_var_es.py
+# Level-96: Monte Carlo VaR & ES using a t-Copula style dependence (fast, free-data)
+#
+# Key idea:
+# 1) Estimate correlation on returns (optionally shrunk)
+# 2) Simulate correlated normals Z ~ N(0, Corr)
+# 3) Convert to "t-like" heavy tails via scale mixing:
+#      X = Z * sqrt(nu / S), where S ~ ChiSquare(nu) independent per scenario
+#    => X marginal ~ Student-t(nu) with the same correlation structure
+# 4) Map X to asset return distribution using empirical inverse CDF (fast)
+# 5) Portfolio MC return => VaR/ES
+#
+# No scipy needed. No slow per-element integration.
+#
+# Outputs:
+#   - level96_mc_tcopula_var_es.csv
+#   - level96_mc_tcopula_var_es_summary.json
+#
+# Run:
+#   python level96_mc_tcopula_var_es.py
+#   python level96_mc_tcopula_var_es.py --symbols SPY QQQ IWM TLT GLD --alpha 0.01 --n-sims 200000
+#   python level96_mc_tcopula_var_es.py --start 2015-01-01 --nu 8 --corr-shrink 0.15
+#   python level96_mc_tcopula_var_es.py --weights 0.4 0.25 0.15 0.15 0.05 --symbols SPY QQQ IWM TLT GLD
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05
+    n_sims: int = 200_000
+
+    # Dependence / tails
+    nu: int = 8                  # smaller => heavier tails; typical 6-12
+    corr_shrink: float = 0.10    # shrink correlation toward identity (0=no shrink)
+
+    # Portfolio weights
+    weights: Optional[Tuple[float, ...]] = None  # None -> equal weight
+
+    use_log_returns: bool = True
+    dropna: bool = True
+    seed: int = 42
+
+    out_csv: str = "level96_mc_tcopula_var_es.csv"
+    out_json: str = "level96_mc_tcopula_var_es_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        candidates = [
+            ("Adj Close", symbol),
+            ("Close", symbol),
+            (symbol, "Adj Close"),
+            (symbol, "Close"),
+        ]
+        for key in candidates:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+
+        # fallback scan
+        cols = []
+        for c in px.columns:
+            c0 = str(c[0]).lower()
+            c1 = str(c[1]).lower()
+            if (symbol.lower() in c0 or symbol.lower() in c1) and ("close" in c0):
+                cols.append(c)
+        if cols:
+            s = px[cols[0]].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # batch attempt
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            ss = []
+            ok = True
+            for s in symbols:
+                try:
+                    ss.append(_extract_close_series(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and ss:
+                return pd.concat(ss, axis=1).sort_index()
+    except Exception:
+        pass
+
+    # fallback single
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        frames.append(_extract_close_series(px, s))
+    return pd.concat(frames, axis=1).sort_index()
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+    if use_log:
+        rets = np.log(prices).diff()
+    else:
+        rets = prices.pct_change()
+    rets = rets.replace([np.inf, -np.inf], np.nan)
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# ----------------------------- Helpers -----------------------------
+def shrink_corr(corr: np.ndarray, shrink: float) -> np.ndarray:
+    """
+    Shrink correlation towards identity:
+      corr_shrunk = (1-shrink)*corr + shrink*I
+    Helps avoid numerical issues and speeds Cholesky stability.
+    """
+    n = corr.shape[0]
+    I = np.eye(n)
+    out = (1.0 - shrink) * corr + shrink * I
+    # symmetrize
+    out = 0.5 * (out + out.T)
+    return out
+
+
+def nearest_psd(A: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """
+    Ensure PSD by eigenvalue clipping (fast).
+    """
+    A = 0.5 * (A + A.T)
+    w, v = np.linalg.eigh(A)
+    w = np.maximum(w, eps)
+    B = (v * w) @ v.T
+    B = 0.5 * (B + B.T)
+    d = np.sqrt(np.diag(B))
+    B = B / np.outer(d, d)
+    B = np.clip(B, -1.0, 1.0)
+    np.fill_diagonal(B, 1.0)
+    return B
+
+
+def portfolio_weights(symbols: Tuple[str, ...], weights: Optional[Tuple[float, ...]]) -> np.ndarray:
+    n = len(symbols)
+    if weights is None:
+        return np.ones(n) / n
+    if len(weights) != n:
+        raise RuntimeError(f"--weights length {len(weights)} must match symbols length {n}")
+    w = np.array(weights, dtype=float)
+    s = w.sum()
+    if s == 0 or not np.isfinite(s):
+        raise RuntimeError("Weights sum to 0 or invalid.")
+    return w / s
+
+
+def empirical_ppf(samples_sorted: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """
+    Fast empirical inverse CDF using sorted samples and linear indexing.
+    samples_sorted: shape (T,)
+    u: shape (N,) values in (0,1)
+    """
+    T = samples_sorted.size
+    # rank in [0, T-1]
+    idx = u * (T - 1)
+    lo = np.floor(idx).astype(int)
+    hi = np.minimum(lo + 1, T - 1)
+    w = idx - lo
+    return (1 - w) * samples_sorted[lo] + w * samples_sorted[hi]
+
+
+# ----------------------------- Main pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+    if cfg.dropna:
+        rets = rets.dropna(how="any")
+
+    if rets.empty or len(rets) < 500:
+        raise RuntimeError(f"Not enough return history after cleaning. rows={len(rets)}")
+
+    n_assets = rets.shape[1]
+    w = portfolio_weights(cfg.symbols, cfg.weights)
+
+    print(f"[INFO] Data rows={len(rets)}, assets={n_assets}, sims={cfg.n_sims}, nu={cfg.nu}")
+
+    # correlation
+    corr = np.corrcoef(rets.values, rowvar=False)
+    corr = shrink_corr(corr, cfg.corr_shrink)
+    corr = nearest_psd(corr)
+
+    # cholesky
+    L = np.linalg.cholesky(corr)
+
+    # --- Simulate t-like copula drivers ---
+    # Z ~ N(0,Corr), shape (n_sims, n_assets)
+    Z = np.random.randn(cfg.n_sims, n_assets) @ L.T
+
+    # scale mixing for Student-t margins:
+    # S ~ ChiSquare(nu) / nu => scale = 1/sqrt(S/nu) = sqrt(nu/S)
+    # Use numpy's chisquare: returns ChiSquare(nu)
+    S = np.random.chisquare(df=cfg.nu, size=cfg.n_sims)
+    scale = np.sqrt(cfg.nu / S).reshape(-1, 1)
+    X = Z * scale  # heavy-tailed correlated drivers
+
+    # Convert drivers to uniforms using normal CDF approximation
+    # We'll use erf-based normal CDF: Phi(x) = 0.5*(1+erf(x/sqrt(2)))
+    U = 0.5 * (1.0 + np.erf(X / math.sqrt(2.0)))
+    # clamp away from 0/1
+    U = np.clip(U, 1e-6, 1.0 - 1e-6)
+
+    # Map uniforms to each asset's empirical return distribution
+    sim_rets = np.zeros_like(U)
+    for j, sym in enumerate(cfg.symbols):
+        samp = np.sort(rets[sym].values.astype(float))
+        sim_rets[:, j] = empirical_ppf(samp, U[:, j])
+
+    port_sim = sim_rets @ w
+
+    # VaR / ES
+    var_mc = float(np.quantile(port_sim, cfg.alpha))
+    es_mc = float(port_sim[port_sim <= var_mc].mean())
+
+    # Historical (for comparison)
+    port_hist = float("nan")
+    var_hist = float("nan")
+    es_hist = float("nan")
+    ph = (rets.values @ w)
+    if ph.size > 0:
+        port_hist = float(ph.mean())
+        var_hist = float(np.quantile(ph, cfg.alpha))
+        es_hist = float(ph[ph <= var_hist].mean())
+
+    # output dataframe: only store key series to keep file small
+    out = pd.DataFrame({
+        "port_sim": port_sim
+    })
+    out["is_tail"] = (out["port_sim"] <= var_mc).astype(int)
+
+    ann_vol_hist = float(np.std(ph, ddof=1) * math.sqrt(252.0))
+    ann_ret_hist = float(np.mean(ph) * 252.0)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "assets": int(n_assets),
+        },
+        "portfolio": {
+            "symbols": list(cfg.symbols),
+            "weights": [float(x) for x in w],
+            "hist_ann_ret": ann_ret_hist,
+            "hist_ann_vol": ann_vol_hist,
+        },
+        "results": {
+            "mc_var": var_mc,
+            "mc_es": es_mc,
+            "hist_var": var_hist,
+            "hist_es": es_hist,
+            "alpha": float(cfg.alpha),
+        },
+        "notes": [
+            "This is a fast t-like copula simulation using scale-mixture of normals (Student-t margins).",
+            "Uniform mapping uses normal CDF approximation; empirical inverse CDF maps to asset return distribution.",
+            "Use larger nu for lighter tails (e.g., 15-30). Smaller nu for crisis-like tails (e.g., 4-10)."
+        ]
+    }
+
+    return {"sim": out, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    df: pd.DataFrame = result["sim"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    df.to_csv(cfg.out_csv, index=False)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved sims → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    r = summary["results"]
+    print(
+        f"[RESULT] alpha={r['alpha']:.3f}  MC VaR={r['mc_var']:.6f}  MC ES={r['mc_es']:.6f}  "
+        f"Hist VaR={r['hist_var']:.6f}  Hist ES={r['hist_es']:.6f}"
+    )
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-96: Monte Carlo VaR/ES using a fast t-like copula simulation")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--n-sims", type=int, default=Config.n_sims)
+
+    p.add_argument("--nu", type=int, default=Config.nu)
+    p.add_argument("--corr-shrink", type=float, default=Config.corr_shrink)
+
+    p.add_argument("--weights", nargs="+", type=float, default=None)
+
+    p.add_argument("--simple-returns", action="store_true")
+    p.add_argument("--no-dropna", action="store_true")
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    weights = tuple(a.weights) if a.weights is not None else None
+
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        alpha=float(a.alpha),
+        n_sims=int(a.n_sims),
+        nu=int(a.nu),
+        corr_shrink=float(a.corr_shrink),
+        weights=weights,
+        use_log_returns=(not a.simple_returns),
+        dropna=(not a.no_dropna),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+---
+
+## If you want Level-96 to be even more “official”
+
+Common variants of Level-96 in quant roadmaps are:
+
+1. **Filtered Historical Simulation (FHS)** VaR/ES (GARCH volatility filter)
+2. **Cornish–Fisher VaR** (skew/kurtosis adjusted)
+3. **EVT (Peaks Over Threshold)** tail VaR/ES
+
+If you tell me which one your Level-96 is supposed to be, I’ll rewrite it to match exactly.

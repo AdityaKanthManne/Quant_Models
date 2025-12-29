@@ -1,0 +1,418 @@
+Level-93 — here’s a **fast, robust** script (no “forever loops”) that avoids the yfinance/pandas rename issues you hit.
+
+## ✅ Level-93: MES / LRMES (Systemic Risk “Expected Shortfall” style) — free data
+
+**What it computes (daily):**
+
+* **MESᵢ(α)** =  E[rᵢ | rₘ ≤ qₘ(α)]  (asset’s expected return when the market is in its left tail)
+* **βᵢ(t)** = dynamic beta via **EWMA covariance**
+* **LRMESᵢ(t)** = long-run MES proxy from MES (optional, common approximation)
+* Outputs:
+
+  * `level93_mes_daily.csv` (TCI-like summary but for MES/beta/LRMES)
+  * `level93_mes_summary.json`
+
+This runs fast because it’s mostly vectorized + 8×8 matrix ops.
+
+---
+
+# Full code: `level93_mes_lrmes.py`
+
+```python
+# level93_mes_lrmes.py
+# Level-93: MES / LRMES (Systemic Risk) using free data (yfinance) + EWMA beta
+#
+# Computes:
+#  - Market tail threshold q_m(alpha)
+#  - MES_i(alpha) = E[r_i | r_m <= q_m(alpha)]
+#  - EWMA beta(t) for each asset vs market
+#  - Optional LRMES approximation based on MES (fast, no heavy GARCH)
+#
+# Outputs:
+#  - level93_mes_daily.csv
+#  - level93_mes_summary.json
+#
+# Run:
+#   python level93_mes_lrmes.py
+#   python level93_mes_lrmes.py --market SPY --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --alpha 0.05
+#   python level93_mes_lrmes.py --alpha 0.01 --lam 0.97 --min_obs 600
+
+import os
+import json
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    market: str = "SPY"
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05         # market tail quantile for MES conditioning
+    lam: float = 0.97           # EWMA decay for beta/cov
+    use_log_returns: bool = True
+
+    min_obs: int = 600          # history needed before emitting time series
+    clip_u: float = 1e-6        # numerical safety
+
+    # LRMES proxy options
+    compute_lrmes: bool = True
+    lrmes_horizon_weeks: int = 18   # common horizon used in some approximations
+    lrmes_cap: float = 0.999        # keep within (0,1)
+
+    seed: int = 42
+
+    out_csv: str = "level93_mes_daily.csv"
+    out_json: str = "level93_mes_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        candidates = [
+            ("Adj Close", symbol),
+            ("Close", symbol),
+            (symbol, "Adj Close"),
+            (symbol, "Close"),
+        ]
+        for key in candidates:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+
+        # fallback scan
+        cols = []
+        for c in px.columns:
+            c0 = str(c[0]).lower()
+            c1 = str(c[1]).lower()
+            if (symbol.lower() in c0 or symbol.lower() in c1) and ("close" in c0 or "close" in c1):
+                cols.append(c)
+        if cols:
+            s = px[cols[0]].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # batch download first (faster)
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            ss = []
+            ok = True
+            for s in symbols:
+                try:
+                    ss.append(_extract_close_series(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and ss:
+                return pd.concat(ss, axis=1).sort_index().dropna(how="any")
+    except Exception:
+        pass
+
+    # fallback per symbol
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        frames.append(_extract_close_series(px, s))
+    return pd.concat(frames, axis=1).sort_index().dropna(how="any")
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    if use_log:
+        rets = np.log(prices).diff()
+    else:
+        rets = prices.pct_change()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    # business-day regularization (helps align)
+    rets = rets.asfreq("B").dropna()
+    return rets
+
+
+# ----------------------------- Metrics -----------------------------
+def ewma_beta_series(rm: np.ndarray, ri: np.ndarray, lam: float) -> np.ndarray:
+    """
+    EWMA beta(t) = cov_i,m(t) / var_m(t)
+    cov update: C = lam*C + (1-lam)*x*y
+    var update: V = lam*V + (1-lam)*y*y
+    """
+    T = len(rm)
+    beta = np.full(T, np.nan)
+
+    # initialize with sample moments on first block to avoid long warm-up
+    C = float(np.cov(ri, rm, ddof=1)[0, 1])
+    V = float(np.var(rm, ddof=1))
+    V = max(V, 1e-18)
+
+    for t in range(T):
+        x = float(ri[t])
+        y = float(rm[t])
+        C = lam * C + (1.0 - lam) * (x * y)
+        V = lam * V + (1.0 - lam) * (y * y)
+        V = max(V, 1e-18)
+        beta[t] = C / V
+    return beta
+
+
+def compute_mes(rm: np.ndarray, ri: np.ndarray, alpha: float) -> float:
+    q = float(np.quantile(rm, alpha))
+    mask = rm <= q
+    if mask.sum() < 10:
+        return float("nan")
+    return float(np.mean(ri[mask]))
+
+
+def lrmes_proxy_from_mes(mes: float, horizon_weeks: int, cap: float) -> float:
+    """
+    Fast LRMES proxy (kept bounded).
+    Note: MES is typically negative in market tail. This proxy maps
+    more negative MES -> higher LRMES (bigger expected equity loss).
+    """
+    if not np.isfinite(mes):
+        return float("nan")
+    # exponential map; if mes is negative => exp(h*mes) < 1 => LRMES > 0
+    lr = 1.0 - float(np.exp(horizon_weeks * mes))
+    lr = float(np.clip(lr, 0.0, cap))
+    return lr
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    # Ensure market included
+    all_syms = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.market]))
+
+    print(f"[INFO] Downloading prices for {all_syms} from {cfg.start} ...")
+    prices = load_prices(all_syms, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+
+    # keep only what we need
+    keep_cols = [c for c in all_syms if c in rets.columns]
+    rets = rets[keep_cols].dropna(how="any")
+
+    if cfg.market not in rets.columns:
+        raise RuntimeError(f"Market '{cfg.market}' missing from returns columns.")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    if len(rets) < cfg.min_obs:
+        raise RuntimeError(f"Not enough return rows ({len(rets)}) for min_obs={cfg.min_obs}")
+
+    rm = rets[cfg.market].values
+    idx = rets.index
+
+    out_rows = []
+    summary_assets = {}
+
+    # static MES (whole sample) for quick ranking
+    mes_static = {}
+
+    for sym in cfg.symbols:
+        if sym == cfg.market or sym not in rets.columns:
+            continue
+        ri = rets[sym].values
+
+        # whole-sample MES
+        mes = compute_mes(rm, ri, cfg.alpha)
+        mes_static[sym] = mes
+
+        # EWMA beta time series
+        beta = ewma_beta_series(rm, ri, cfg.lam)
+
+        # rolling/expanding "MES" time series (fast expanding tail conditioning)
+        # We avoid expensive rolling quantiles by using expanding quantiles every K steps.
+        # This is the main speed trick.
+        K = 20  # update tail threshold every 20 days
+        q_m = np.full(len(rm), np.nan)
+        for t in range(cfg.min_obs, len(rm)):
+            if t == cfg.min_obs or (t % K == 0):
+                q_m[t] = float(np.quantile(rm[:t + 1], cfg.alpha))
+            else:
+                q_m[t] = q_m[t - 1]
+
+        # daily MES proxy: mean of ri over tail days up to t (expanding)
+        # Vectorized via cumulative sums of tail mask
+        tail_mask = rm <= q_m
+        tail_mask[:cfg.min_obs] = False
+
+        tail_counts = np.cumsum(tail_mask.astype(int))
+        tail_sums = np.cumsum(ri * tail_mask.astype(float))
+        mes_t = np.full(len(rm), np.nan)
+        valid = tail_counts > 10
+        mes_t[valid] = tail_sums[valid] / tail_counts[valid]
+
+        if cfg.compute_lrmes:
+            lrmes_t = np.array([lrmes_proxy_from_mes(m, cfg.lrmes_horizon_weeks, cfg.lrmes_cap) for m in mes_t])
+        else:
+            lrmes_t = np.full(len(rm), np.nan)
+
+        # store daily outputs (start at min_obs for stability)
+        for t in range(cfg.min_obs, len(rm)):
+            out_rows.append({
+                "date": idx[t],
+                "symbol": sym,
+                "beta_ewma": float(beta[t]),
+                "MES_expanding": float(mes_t[t]) if np.isfinite(mes_t[t]) else np.nan,
+                "LRMES_proxy": float(lrmes_t[t]) if np.isfinite(lrmes_t[t]) else np.nan,
+                "market_tail_q": float(q_m[t]) if np.isfinite(q_m[t]) else np.nan,
+            })
+
+        # summary per asset
+        summary_assets[sym] = {
+            "MES_static": float(mes) if np.isfinite(mes) else None,
+            "beta_last": float(beta[-1]) if np.isfinite(beta[-1]) else None,
+        }
+
+    daily = pd.DataFrame(out_rows).sort_values(["date", "symbol"])
+    if daily.empty:
+        raise RuntimeError("No outputs produced. Check symbols/min_obs.")
+
+    # rank by MES_static (more negative => worse in market crashes)
+    rank = sorted(
+        [(k, v) for k, v in mes_static.items() if np.isfinite(v)],
+        key=lambda kv: kv[1]
+    )
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "market": {
+            "symbol": cfg.market,
+            "alpha": float(cfg.alpha),
+        },
+        "ranking_by_MES_most_negative_first": [k for k, _ in rank],
+        "assets": summary_assets,
+    }
+
+    return {"daily": daily, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    daily: pd.DataFrame = result["daily"]  # type: ignore
+    summary: Dict = result["summary"]      # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    daily.to_csv(cfg.out_csv, index=False)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    # quick last-day snapshot
+    last_date = daily["date"].max()
+    snap = daily[daily["date"] == last_date].copy()
+    snap = snap.sort_values("MES_expanding")
+    print(f"[LAST] Date={pd.to_datetime(last_date).date()}  (sorted by MES, worse first)")
+    for _, r in snap.head(min(8, len(snap))).iterrows():
+        print(f"  {r['symbol']:>5s}  beta={r['beta_ewma']:+.3f}  MES={r['MES_expanding']:+.5f}  LRMES={r['LRMES_proxy']:.3f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-93: MES / LRMES (systemic risk) with EWMA beta")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--market", type=str, default=Config.market)
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--lam", type=float, default=Config.lam)
+    p.add_argument("--min_obs", type=int, default=Config.min_obs)
+
+    p.add_argument("--simple-returns", action="store_true")
+    p.add_argument("--no-lrmes", action="store_true")
+    p.add_argument("--lrmes-horizon-weeks", type=int, default=Config.lrmes_horizon_weeks)
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        market=a.market,
+        start=a.start,
+        alpha=float(a.alpha),
+        lam=float(a.lam),
+        use_log_returns=(not a.simple_returns),
+        min_obs=int(a.min_obs),
+        compute_lrmes=(not a.no_lrmes),
+        lrmes_horizon_weeks=int(a.lrmes_horizon_weeks),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+---
+
+## If it still feels “slow”, use these faster settings
+
+* Less history + no LRMES:
+
+```bash
+python level93_mes_lrmes.py --min_obs 450 --no-lrmes
+```
+
+* Or start later:
+
+```bash
+python level93_mes_lrmes.py --start 2015-01-01
+```
+
+If you paste the **exact Level-93 prompt/spec** you’re following (like you did for Level-83), I’ll align the outputs/metrics exactly to that level’s requirements.

@@ -1,0 +1,469 @@
+## Level-99: EVT (Extreme Value Theory) VaR/ES using POT-GPD (Rolling) + Backtesting (No SciPy)
+
+This is the **next step after Level-98 dynamic VaR/ES**: instead of assuming Normal tails (or bootstrapping residuals), we **model the extreme loss tail explicitly** using **Peaks-Over-Threshold (POT)** with a **Generalized Pareto Distribution (GPD)** — fast + realistic in crises.
+
+### Why your previous versions felt slow / error-prone
+
+* Anything involving **custom t-copula integration / PPF/CDF** or large Monte Carlo grids will run long.
+* SciPy-free “manual CDF inversions” often become slow loops.
+* Here: **no SciPy, no heavy optimizers, no nested numerical integration**.
+
+---
+
+```python
+# level99_evt_pot_gpd_var_es.py
+# Level-99: EVT POT-GPD Dynamic VaR/ES (Rolling) + Backtesting (SciPy-free)
+#
+# Idea:
+# - Work on portfolio losses L = -r (right tail).
+# - For each rolling window:
+#     u = quantile(L, q_u)  (threshold)
+#     y = L - u | L>u       (exceedances)
+#     Fit GPD params (xi, beta) via Method-of-Moments (fast, SciPy-free)
+#     VaR_L(alpha) from POT formula
+#     ES_L(alpha) from GPD tail mean
+# - Convert back to returns: VaR_r = -VaR_L, ES_r = -ES_L
+# - Backtest exceptions r_t <= VaR_t
+#
+# Outputs:
+#   - level99_evt_series.csv
+#   - level99_evt_summary.json
+#
+# Run:
+#   python level99_evt_pot_gpd_var_es.py
+#   python level99_evt_pot_gpd_var_es.py --alpha 0.01 --window 1260 --q_u 0.95 --min-exc 50
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+    weights: Optional[Tuple[float, ...]] = None  # None -> equal-weight
+
+    use_log_returns: bool = True
+    dropna: bool = True
+
+    # EVT params
+    alpha: float = 0.05          # tail prob (on returns left tail; on losses right tail)
+    window: int = 1000           # rolling window length
+    q_u: float = 0.90            # threshold quantile for losses (e.g., 0.90 or 0.95)
+    min_exc: int = 40            # minimum exceedances to fit GPD reliably
+    xi_clip: Tuple[float, float] = (-0.45, 0.45)  # stabilize MoM
+
+    seed: int = 42
+
+    out_csv: str = "level99_evt_series.csv"
+    out_json: str = "level99_evt_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _extract_close(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Adj Close", symbol), ("Close", symbol), (symbol, "Adj Close"), (symbol, "Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # Try batch first (faster)
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            series = []
+            ok = True
+            for s in symbols:
+                try:
+                    series.append(_extract_close(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and series:
+                return pd.concat(series, axis=1).sort_index()
+    except Exception:
+        pass
+
+    # Fallback single symbol
+    series = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        series.append(_extract_close(px, s))
+    return pd.concat(series, axis=1).sort_index()
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+    rets = (np.log(prices).diff() if use_log else prices.pct_change())
+    rets = rets.replace([np.inf, -np.inf], np.nan)
+    return rets.dropna(how="all")
+
+
+def portfolio_weights(symbols: Tuple[str, ...], weights: Optional[Tuple[float, ...]]) -> np.ndarray:
+    n = len(symbols)
+    if weights is None:
+        return np.ones(n) / n
+    if len(weights) != n:
+        raise RuntimeError(f"--weights length {len(weights)} must match symbols length {n}")
+    w = np.array(weights, dtype=float)
+    s = float(w.sum())
+    if not np.isfinite(s) or s == 0.0:
+        raise RuntimeError("Weights sum is invalid/zero.")
+    return w / s
+
+
+# ----------------------------- Backtest helpers (SciPy-free) -----------------------------
+def _safe_log(x: float) -> float:
+    return math.log(max(x, 1e-15))
+
+
+def kupiec_pof(exceed: np.ndarray, alpha: float) -> Dict[str, float]:
+    T = int(exceed.size)
+    x = int(exceed.sum())
+    phat = x / T if T > 0 else 0.0
+
+    if x == 0:
+        lr = -2.0 * (T * _safe_log(1.0 - alpha))
+    elif x == T:
+        lr = -2.0 * (T * _safe_log(alpha))
+    else:
+        lnL0 = (T - x) * _safe_log(1.0 - alpha) + x * _safe_log(alpha)
+        lnL1 = (T - x) * _safe_log(1.0 - phat) + x * _safe_log(phat)
+        lr = -2.0 * (lnL0 - lnL1)
+
+    return {"T": float(T), "x": float(x), "phat": float(phat), "LR_pof": float(lr)}
+
+
+def christoffersen_ind(exceed: np.ndarray) -> Dict[str, float]:
+    e = exceed.astype(int)
+    if e.size < 2:
+        return {"LR_ind": float("nan"), "n00": 0.0, "n01": 0.0, "n10": 0.0, "n11": 0.0}
+
+    e0, e1 = e[:-1], e[1:]
+    n00 = int(((e0 == 0) & (e1 == 0)).sum())
+    n01 = int(((e0 == 0) & (e1 == 1)).sum())
+    n10 = int(((e0 == 1) & (e1 == 0)).sum())
+    n11 = int(((e0 == 1) & (e1 == 1)).sum())
+
+    pi0 = n01 / (n00 + n01) if (n00 + n01) > 0 else 0.0
+    pi1 = n11 / (n10 + n11) if (n10 + n11) > 0 else 0.0
+    pi = (n01 + n11) / (n00 + n01 + n10 + n11) if (n00 + n01 + n10 + n11) > 0 else 0.0
+
+    lnL1 = n00 * _safe_log(1 - pi0) + n01 * _safe_log(pi0) + n10 * _safe_log(1 - pi1) + n11 * _safe_log(pi1)
+    lnL0 = (n00 + n10) * _safe_log(1 - pi) + (n01 + n11) * _safe_log(pi)
+    lr = -2.0 * (lnL0 - lnL1)
+
+    return {
+        "LR_ind": float(lr),
+        "n00": float(n00), "n01": float(n01), "n10": float(n10), "n11": float(n11),
+        "pi": float(pi), "pi0": float(pi0), "pi1": float(pi1)
+    }
+
+
+def christoffersen_cc(exceed: np.ndarray, alpha: float) -> Dict[str, float]:
+    pof = kupiec_pof(exceed, alpha)
+    ind = christoffersen_ind(exceed)
+    lr_cc = float(pof["LR_pof"] + ind["LR_ind"]) if np.isfinite(ind["LR_ind"]) else float("nan")
+    return {"LR_cc": lr_cc, "pof": pof, "ind": ind}
+
+
+def es_tail_score(r: np.ndarray, var: np.ndarray, es: np.ndarray) -> Dict[str, float]:
+    mask = r <= var
+    n = int(mask.sum())
+    if n == 0:
+        return {"n_tail": 0.0, "tail_mean_r": float("nan"), "tail_mean_es": float("nan"), "score": float("nan")}
+    tail_r = r[mask]
+    tail_es = es[mask]
+    return {
+        "n_tail": float(n),
+        "tail_mean_r": float(tail_r.mean()),
+        "tail_mean_es": float(tail_es.mean()),
+        "score": float((tail_r - tail_es).mean()),
+    }
+
+
+# ----------------------------- EVT: POT-GPD (fast MoM fit) -----------------------------
+def gpd_mom_fit(y: np.ndarray, xi_clip: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    Method-of-moments fit for GPD on exceedances y>0.
+    mean = beta/(1-xi)  (xi<1)
+    var  = beta^2/((1-xi)^2*(1-2xi)) (xi<0.5)
+
+    => var/mean^2 = 1/(1-2xi)  => xi = 0.5*(1 - mean^2/var)
+    beta = mean*(1-xi)
+
+    This is VERY fast and avoids long optimizers.
+    """
+    y = y.astype(float)
+    m = float(y.mean())
+    v = float(y.var(ddof=1)) if y.size >= 2 else float(y.var())
+    v = max(v, 1e-12)
+
+    xi = 0.5 * (1.0 - (m * m) / v)
+    xi = float(np.clip(xi, xi_clip[0], xi_clip[1]))
+
+    beta = m * (1.0 - xi)
+    beta = float(max(beta, 1e-12))
+    return xi, beta
+
+
+def pot_var_es(losses: np.ndarray, alpha: float, q_u: float, min_exc: int, xi_clip: Tuple[float, float]) -> Tuple[float, float, float, int]:
+    """
+    losses: array of positive-ish losses (right tail is large)
+    returns:
+      VaR_loss(alpha), ES_loss(alpha), threshold u, exceedance count k
+    """
+    L = losses.astype(float)
+    u = float(np.quantile(L, q_u))
+    exc = L[L > u] - u
+    k = int(exc.size)
+    n = int(L.size)
+
+    if k < min_exc or n <= 0:
+        return float("nan"), float("nan"), u, k
+
+    p_u = k / n  # P(L > u)
+    if alpha >= p_u:
+        # asking for a tail prob that is not beyond threshold region; POT not appropriate
+        return float("nan"), float("nan"), u, k
+
+    xi, beta = gpd_mom_fit(exc, xi_clip=xi_clip)
+
+    # VaR for losses at tail prob alpha: P(L > VaR) = alpha
+    # P(L > l) = p_u * (1 + xi*(l-u)/beta)^(-1/xi)
+    # => l = u + (beta/xi)*((alpha/p_u)^(-xi) - 1) , xi!=0
+    if abs(xi) < 1e-8:
+        varL = u + beta * math.log(p_u / alpha)
+    else:
+        varL = u + (beta / xi) * (((alpha / p_u) ** (-xi)) - 1.0)
+
+    # ES for losses at alpha (xi<1):
+    # yq = varL - u
+    # ES = varL + (beta + xi*yq)/(1 - xi)
+    if xi >= 0.999:
+        esL = float("nan")
+    else:
+        yq = varL - u
+        esL = varL + (beta + xi * yq) / (1.0 - xi)
+
+    return float(varL), float(esL), u, k
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+    if cfg.dropna:
+        rets = rets.dropna(how="any")
+    if rets.empty:
+        raise RuntimeError("No returns after cleaning.")
+
+    w = portfolio_weights(cfg.symbols, cfg.weights)
+    port_r = rets.values @ w
+    idx = rets.index
+
+    n = port_r.size
+    if n <= cfg.window + 5:
+        raise RuntimeError(f"Not enough rows for window={cfg.window}. rows={n}")
+
+    print(f"[INFO] rows={n}, window={cfg.window}, alpha={cfg.alpha}, q_u={cfg.q_u}, min_exc={cfg.min_exc}")
+    losses = -port_r  # right tail is big losses
+
+    VaR = np.full(n, np.nan, dtype=float)
+    ES = np.full(n, np.nan, dtype=float)
+    U = np.full(n, np.nan, dtype=float)
+    K = np.full(n, np.nan, dtype=float)
+
+    # Rolling POT-GPD
+    for t in range(cfg.window, n):
+        Lwin = losses[t - cfg.window:t]
+        varL, esL, u, k = pot_var_es(
+            losses=Lwin,
+            alpha=cfg.alpha,
+            q_u=cfg.q_u,
+            min_exc=cfg.min_exc,
+            xi_clip=cfg.xi_clip,
+        )
+        # Convert back to returns (left tail)
+        VaR[t] = -varL if np.isfinite(varL) else np.nan
+        ES[t] = -esL if np.isfinite(esL) else np.nan
+        U[t] = u
+        K[t] = k
+
+        if (t % 500) == 0:
+            print(f"[INFO] t={t}/{n} last_k={k} last_VaR={VaR[t]:.5f}")
+
+    series = pd.DataFrame({
+        "date": idx,
+        "port_ret": port_r,
+        "loss": losses,
+        "VaR_evt": VaR,
+        "ES_evt": ES,
+        "u_loss_threshold": U,
+        "n_exceed": K,
+    }).set_index("date")
+
+    # Backtest where VaR is available
+    valid = np.isfinite(series["VaR_evt"].values) & np.isfinite(series["ES_evt"].values)
+    r_bt = series["port_ret"].values[valid]
+    var_bt = series["VaR_evt"].values[valid]
+    es_bt = series["ES_evt"].values[valid]
+
+    exceed = (r_bt <= var_bt).astype(int)
+    pof = kupiec_pof(exceed, cfg.alpha)
+    ind = christoffersen_ind(exceed)
+    cc = christoffersen_cc(exceed, cfg.alpha)
+    es_score = es_tail_score(r_bt, var_bt, es_bt)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {"start": str(idx.min().date()), "end": str(idx.max().date()), "n_returns": int(n)},
+        "portfolio": {"symbols": list(cfg.symbols), "weights": [float(x) for x in w]},
+        "availability": {
+            "n_var_points": int(np.isfinite(VaR).sum()),
+            "n_es_points": int(np.isfinite(ES).sum()),
+        },
+        "backtests": {
+            "kupiec_pof": pof,
+            "christoffersen_ind": ind,
+            "christoffersen_cc": cc,
+            "es_tail_score": es_score,
+        },
+        "notes": [
+            "EVT POT-GPD models the extreme loss tail; more crisis-sensitive than normal VaR.",
+            "MoM fit is fast and stable, but for very small exceedance samples, results are NaN by design.",
+            "LR statistics reported without p-values (SciPy-free)."
+        ],
+    }
+
+    return {"series": series, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    series: pd.DataFrame = result["series"]  # type: ignore
+    summary: Dict = result["summary"]        # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    series.to_csv(cfg.out_csv)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    bt = summary["backtests"]
+    pof = bt["kupiec_pof"]
+    ind = bt["christoffersen_ind"]
+    cc = bt["christoffersen_cc"]
+    esb = bt["es_tail_score"]
+
+    print(f"[OK] Saved series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(f"[POF] T={int(pof['T'])} x={int(pof['x'])} phat={pof['phat']:.4f} LR={pof['LR_pof']:.3f}")
+    print(f"[IND] LR={ind['LR_ind']:.3f} n01={int(ind['n01'])} n11={int(ind['n11'])} pi0={ind['pi0']:.3f} pi1={ind['pi1']:.3f}")
+    print(f"[CC ] LR={cc['LR_cc']:.3f}")
+    print(f"[ES ] tail_n={int(esb['n_tail'])} score={esb['score']:.6f} (near 0 is good)")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-99: EVT POT-GPD Dynamic VaR/ES + Backtesting (SciPy-free)")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--weights", nargs="+", type=float, default=None)
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--window", type=int, default=Config.window)
+    p.add_argument("--q_u", type=float, default=Config.q_u)
+    p.add_argument("--min-exc", dest="min_exc", type=int, default=Config.min_exc)
+
+    p.add_argument("--simple-returns", action="store_true")
+    p.add_argument("--no-dropna", action="store_true")
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    weights = tuple(a.weights) if a.weights is not None else None
+
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        weights=weights,
+        alpha=float(a.alpha),
+        window=int(a.window),
+        q_u=float(a.q_u),
+        min_exc=int(a.min_exc),
+        use_log_returns=(not a.simple_returns),
+        dropna=(not a.no_dropna),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### Recommended “good + fast” settings
+
+Use these first (stable and quick):
+
+```bash
+python level99_evt_pot_gpd_var_es.py --alpha 0.05 --window 1000 --q_u 0.90 --min-exc 40
+```
+
+If you want *more extreme* tail modeling (but sometimes fewer exceedances):
+
+```bash
+python level99_evt_pot_gpd_var_es.py --alpha 0.01 --window 1260 --q_u 0.95 --min-exc 50
+```
+
+If you share what Level-99 is supposed to be in your roadmap (1–2 lines), I’ll match the exact outputs/metrics naming to your Level list.

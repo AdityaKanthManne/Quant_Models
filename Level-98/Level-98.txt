@@ -1,0 +1,488 @@
+Here you go — **Level-98** (built to be the natural next step after Level-97):
+
+## Level-98: Dynamic VaR/ES with EWMA Volatility + Filtered Historical Simulation (FHS) + Backtesting
+
+This fixes the “static risk” problem by making VaR/ES **time-varying**.
+
+### What it does
+
+* Downloads prices (robust yfinance loader)
+* Builds portfolio returns
+* Estimates **EWMA volatility** (RiskMetrics style, default λ=0.94)
+* Computes VaR/ES using either:
+
+  * **EWMA-Normal** (fast, parametric)
+  * **FHS (Filtered Historical Simulation)** (bootstraps standardized residuals → re-scales by current volatility; still free-data, no SciPy)
+* Runs **Kupiec POF**, **Christoffersen IND/CC**, and an **ES tail score**
+* Outputs:
+
+  * `level98_dynamic_var_series.csv`
+  * `level98_dynamic_var_summary.json`
+
+No SciPy. No statsmodels. No “running forever” loops.
+
+---
+
+```python
+# level98_dynamic_var_fhs.py
+# Level-98: Dynamic VaR/ES with EWMA Volatility + Filtered Historical Simulation (FHS) + Backtesting
+#
+# Outputs:
+#   - level98_dynamic_var_series.csv
+#   - level98_dynamic_var_summary.json
+#
+# Run:
+#   python level98_dynamic_var_fhs.py
+#   python level98_dynamic_var_fhs.py --method fhs --sims 20000 --window 756 --alpha 0.01
+#   python level98_dynamic_var_fhs.py --method ewma_normal --lambda 0.94
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    weights: Optional[Tuple[float, ...]] = None  # None -> equal-weight
+
+    alpha: float = 0.05
+    window: int = 756           # bootstrap window on standardized residuals
+    lam: float = 0.94           # EWMA lambda (RiskMetrics)
+
+    method: str = "fhs"         # "fhs" or "ewma_normal"
+    sims: int = 20000           # only used for FHS
+    use_log_returns: bool = True
+    dropna: bool = True
+    seed: int = 42
+
+    out_csv: str = "level98_dynamic_var_series.csv"
+    out_json: str = "level98_dynamic_var_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if px is None or px.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        # typical: columns like ('Close','SPY') etc.
+        for key in [("Adj Close", symbol), ("Close", symbol), (symbol, "Adj Close"), (symbol, "Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                s.name = symbol
+                return s
+        raise RuntimeError(f"Could not extract Close/Adj Close for {symbol} from MultiIndex columns.")
+
+    for col in ["Adj Close", "Close"]:
+        if col in px.columns:
+            s = px[col].copy()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s.name = symbol
+            return s
+
+    raise RuntimeError(f"Missing Close/Adj Close for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    symbols = tuple(symbols)
+
+    # try batch download
+    try:
+        px_all = yf.download(list(symbols), start=start, progress=False, group_by="column", auto_adjust=False)
+        if px_all is not None and not px_all.empty:
+            series = []
+            ok = True
+            for s in symbols:
+                try:
+                    series.append(_extract_close_series(px_all, s))
+                except Exception:
+                    ok = False
+                    break
+            if ok and series:
+                return pd.concat(series, axis=1).sort_index()
+    except Exception:
+        pass
+
+    # fallback single symbol
+    series = []
+    for s in symbols:
+        px = yf.download(s, start=start, progress=False, auto_adjust=False)
+        series.append(_extract_close_series(px, s))
+    return pd.concat(series, axis=1).sort_index()
+
+
+def compute_returns(prices: pd.DataFrame, use_log: bool) -> pd.DataFrame:
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+    rets = (np.log(prices).diff() if use_log else prices.pct_change())
+    rets = rets.replace([np.inf, -np.inf], np.nan)
+    return rets.dropna(how="all")
+
+
+def portfolio_weights(symbols: Tuple[str, ...], weights: Optional[Tuple[float, ...]]) -> np.ndarray:
+    n = len(symbols)
+    if weights is None:
+        return np.ones(n) / n
+    if len(weights) != n:
+        raise RuntimeError(f"--weights length {len(weights)} must match symbols length {n}")
+    w = np.array(weights, dtype=float)
+    s = float(w.sum())
+    if not np.isfinite(s) or s == 0.0:
+        raise RuntimeError("Weights sum is invalid/zero.")
+    return w / s
+
+
+# ----------------------------- Math helpers (NO SciPy) -----------------------------
+def _safe_log(x: float) -> float:
+    return math.log(max(x, 1e-15))
+
+
+def inv_norm_cdf(p: float) -> float:
+    """Approx inverse standard normal CDF (Acklam-like)."""
+    if p <= 0.0 or p >= 1.0:
+        raise ValueError("p must be in (0,1)")
+
+    a = [-3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00]
+    b = [-5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00,  4.374664141464968e+00,  2.938163982698783e+00]
+    d = [ 7.784695709041462e-03,  3.224671290700398e-01,  2.445134137142996e+00,
+          3.754408661907416e+00]
+
+    plow = 0.02425
+    phigh = 1 - plow
+
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        num = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5])
+        den = ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+        return num / den
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        num = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5])
+        den = ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+        return -(num / den)
+
+    q = p - 0.5
+    r = q * q
+    num = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q
+    den = (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4]) * r + 1)
+    return num / den
+
+
+# ----------------------------- Backtests (NO SciPy) -----------------------------
+def kupiec_pof(exceed: np.ndarray, alpha: float) -> Dict[str, float]:
+    T = int(exceed.size)
+    x = int(exceed.sum())
+    phat = x / T if T > 0 else 0.0
+
+    if x == 0:
+        lr = -2.0 * (T * _safe_log(1.0 - alpha))
+    elif x == T:
+        lr = -2.0 * (T * _safe_log(alpha))
+    else:
+        lnL0 = (T - x) * _safe_log(1.0 - alpha) + x * _safe_log(alpha)
+        lnL1 = (T - x) * _safe_log(1.0 - phat) + x * _safe_log(phat)
+        lr = -2.0 * (lnL0 - lnL1)
+
+    return {"T": float(T), "x": float(x), "phat": float(phat), "LR_pof": float(lr)}
+
+
+def christoffersen_ind(exceed: np.ndarray) -> Dict[str, float]:
+    e = exceed.astype(int)
+    if e.size < 2:
+        return {"LR_ind": float("nan"), "n00": 0.0, "n01": 0.0, "n10": 0.0, "n11": 0.0}
+
+    e0, e1 = e[:-1], e[1:]
+    n00 = int(((e0 == 0) & (e1 == 0)).sum())
+    n01 = int(((e0 == 0) & (e1 == 1)).sum())
+    n10 = int(((e0 == 1) & (e1 == 0)).sum())
+    n11 = int(((e0 == 1) & (e1 == 1)).sum())
+
+    pi0 = n01 / (n00 + n01) if (n00 + n01) > 0 else 0.0
+    pi1 = n11 / (n10 + n11) if (n10 + n11) > 0 else 0.0
+    pi = (n01 + n11) / (n00 + n01 + n10 + n11) if (n00 + n01 + n10 + n11) > 0 else 0.0
+
+    lnL1 = n00 * _safe_log(1 - pi0) + n01 * _safe_log(pi0) + n10 * _safe_log(1 - pi1) + n11 * _safe_log(pi1)
+    lnL0 = (n00 + n10) * _safe_log(1 - pi) + (n01 + n11) * _safe_log(pi)
+    lr = -2.0 * (lnL0 - lnL1)
+
+    return {
+        "LR_ind": float(lr),
+        "n00": float(n00), "n01": float(n01), "n10": float(n10), "n11": float(n11),
+        "pi": float(pi), "pi0": float(pi0), "pi1": float(pi1)
+    }
+
+
+def christoffersen_cc(exceed: np.ndarray, alpha: float) -> Dict[str, float]:
+    pof = kupiec_pof(exceed, alpha)
+    ind = christoffersen_ind(exceed)
+    lr_cc = float(pof["LR_pof"] + ind["LR_ind"]) if np.isfinite(ind["LR_ind"]) else float("nan")
+    return {"LR_cc": lr_cc, **{f"pof_{k}": v for k, v in pof.items()}, **{f"ind_{k}": v for k, v in ind.items()}}
+
+
+def es_tail_score(r: np.ndarray, var: np.ndarray, es: np.ndarray) -> Dict[str, float]:
+    mask = r <= var
+    n = int(mask.sum())
+    if n == 0:
+        return {"n_tail": 0.0, "tail_mean_r": float("nan"), "tail_mean_es": float("nan"), "score": float("nan")}
+    tail_r = r[mask]
+    tail_es = es[mask]
+    return {
+        "n_tail": float(n),
+        "tail_mean_r": float(tail_r.mean()),
+        "tail_mean_es": float(tail_es.mean()),
+        "score": float((tail_r - tail_es).mean()),  # near 0 is good; negative => ES too optimistic
+    }
+
+
+# ----------------------------- EWMA + Dynamic VaR -----------------------------
+def ewma_sigma(returns: np.ndarray, lam: float) -> np.ndarray:
+    """
+    EWMA volatility estimate:
+      sigma2_t = lam*sigma2_{t-1} + (1-lam)*r_{t-1}^2
+    We store sigma_t aligned with returns index (sigma[t] is sigma for time t).
+    """
+    r = returns.astype(float)
+    n = r.size
+    sigma2 = np.full(n, np.nan, dtype=float)
+    # init variance using first 60 obs (or fewer if needed)
+    m = min(60, n)
+    v0 = float(np.var(r[:m], ddof=1)) if m >= 2 else float(np.var(r[:m]))
+    sigma2[0] = max(v0, 1e-12)
+
+    for t in range(1, n):
+        sigma2[t] = lam * sigma2[t - 1] + (1.0 - lam) * (r[t - 1] ** 2)
+
+    return np.sqrt(np.maximum(sigma2, 1e-12))
+
+
+def dynamic_var_es_ewma_normal(returns: np.ndarray, sigma: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    z = inv_norm_cdf(alpha)  # negative
+    pdf = (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * z * z)
+
+    var = sigma * z           # mean assumed 0 for daily returns
+    es = -sigma * (pdf / alpha)
+    return var, es
+
+
+def dynamic_var_es_fhs(returns: np.ndarray, sigma: np.ndarray, alpha: float, window: int, sims: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Filtered Historical Simulation (FHS):
+      eps_t = r_t / sigma_t
+    For each t:
+      sample eps from last `window` eps values (bootstrap)
+      scenario returns = sigma_{t} * eps_sample   (or sigma_{t+1}; here sigma_t is next-day scale proxy)
+      VaR/ES from scenario distribution
+    """
+    r = returns.astype(float)
+    eps = r / np.maximum(sigma, 1e-12)
+
+    n = r.size
+    var = np.full(n, np.nan, dtype=float)
+    es = np.full(n, np.nan, dtype=float)
+
+    rng = np.random.default_rng(seed)
+
+    for t in range(window, n):
+        hist = eps[t - window:t]
+        # bootstrap indices vectorized
+        idx = rng.integers(0, window, size=sims)
+        scen = sigma[t] * hist[idx]  # dynamic scaling
+        q = float(np.quantile(scen, alpha))
+        var[t] = q
+        es[t] = float(scen[scen <= q].mean())
+
+    return var, es
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    method = cfg.method.lower().strip()
+    if method not in ("fhs", "ewma_normal"):
+        raise RuntimeError("--method must be 'fhs' or 'ewma_normal'")
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices, cfg.use_log_returns)
+    if cfg.dropna:
+        rets = rets.dropna(how="any")
+
+    if rets.empty:
+        raise RuntimeError("No returns after cleaning.")
+
+    w = portfolio_weights(cfg.symbols, cfg.weights)
+    port = rets.values @ w
+    idx = rets.index
+
+    print(f"[INFO] Data rows={len(rets)}, assets={rets.shape[1]}, method={method}, alpha={cfg.alpha}, lambda={cfg.lam}")
+    sigma = ewma_sigma(port, cfg.lam)
+
+    if method == "ewma_normal":
+        var, es = dynamic_var_es_ewma_normal(port, sigma, cfg.alpha)
+    else:
+        if cfg.sims < 2000:
+            raise RuntimeError("--sims should be >= 2000 for stable FHS.")
+        if len(port) <= cfg.window + 5:
+            raise RuntimeError(f"Not enough rows for window={cfg.window}. rows={len(port)}")
+        print(f"[INFO] FHS bootstrap: window={cfg.window}, sims={cfg.sims} ...")
+        var, es = dynamic_var_es_fhs(port, sigma, cfg.alpha, cfg.window, cfg.sims, cfg.seed)
+
+    valid = np.isfinite(var) & np.isfinite(es)
+    r_bt = port[valid]
+    var_bt = var[valid]
+    es_bt = es[valid]
+
+    exceed = (r_bt <= var_bt).astype(int)
+
+    pof = kupiec_pof(exceed, cfg.alpha)
+    ind = christoffersen_ind(exceed)
+    cc = christoffersen_cc(exceed, cfg.alpha)
+    es_score = es_tail_score(r_bt, var_bt, es_bt)
+
+    out = pd.DataFrame({
+        "date": idx,
+        "port_ret": port,
+        "sigma_ewma": sigma,
+        "VaR": var,
+        "ES": es,
+    }).set_index("date")
+    out["exceed"] = ((out["port_ret"] <= out["VaR"]) & np.isfinite(out["VaR"])).astype(int)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(idx.min().date()),
+            "end": str(idx.max().date()),
+            "n_returns": int(len(rets)),
+            "n_backtest": int(r_bt.size),
+        },
+        "portfolio": {"symbols": list(cfg.symbols), "weights": [float(x) for x in w]},
+        "backtests": {
+            "kupiec_pof": pof,
+            "christoffersen_ind": ind,
+            "christoffersen_cc": cc,
+            "es_tail_score": es_score,
+        },
+        "notes": [
+            "EWMA makes VaR/ES time-varying; spikes during crises.",
+            "FHS preserves empirical non-normal residual shape while scaling by current volatility.",
+            "LR stats reported without p-values (no chi-square CDF without SciPy)."
+        ],
+    }
+
+    return {"series": out, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    series: pd.DataFrame = result["series"]  # type: ignore
+    summary: Dict = result["summary"]        # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    series.to_csv(cfg.out_csv)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    bt = summary["backtests"]
+    pof = bt["kupiec_pof"]
+    ind = bt["christoffersen_ind"]
+    cc = bt["christoffersen_cc"]
+    esb = bt["es_tail_score"]
+
+    print(f"[OK] Saved series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(f"[POF] T={int(pof['T'])} x={int(pof['x'])} phat={pof['phat']:.4f} LR={pof['LR_pof']:.3f}")
+    print(f"[IND] LR={ind['LR_ind']:.3f} n01={int(ind['n01'])} n11={int(ind['n11'])} pi0={ind['pi0']:.3f} pi1={ind['pi1']:.3f}")
+    print(f"[CC ] LR={cc['LR_cc']:.3f}")
+    print(f"[ES ] tail_n={int(esb['n_tail'])} score={esb['score']:.6f} (near 0 is good)")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-98: Dynamic VaR/ES via EWMA + (FHS or Normal) + Backtesting")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--weights", nargs="+", type=float, default=None)
+
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--window", type=int, default=Config.window)
+    p.add_argument("--lambda", dest="lam", type=float, default=Config.lam)
+
+    p.add_argument("--method", type=str, default=Config.method, choices=["fhs", "ewma_normal"])
+    p.add_argument("--sims", type=int, default=Config.sims)
+
+    p.add_argument("--simple-returns", action="store_true")
+    p.add_argument("--no-dropna", action="store_true")
+    p.add_argument("--seed", type=int, default=Config.seed)
+
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+    weights = tuple(a.weights) if a.weights is not None else None
+
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        weights=weights,
+        alpha=float(a.alpha),
+        window=int(a.window),
+        lam=float(a.lam),
+        method=str(a.method),
+        sims=int(a.sims),
+        use_log_returns=(not a.simple_returns),
+        dropna=(not a.no_dropna),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### If your run is slow
+
+Use these safe fast settings:
+
+* `--method ewma_normal` (instant)
+* or `--method fhs --sims 5000` (still good, much faster than 20k+)
+
+Example:
+
+```bash
+python level98_dynamic_var_fhs.py --method fhs --sims 5000 --window 504 --alpha 0.05
+```
+
+If you paste what your Level-98 spec says (1–3 lines), I’ll align naming + outputs exactly to your course checklist.

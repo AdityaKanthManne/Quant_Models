@@ -1,0 +1,89 @@
+{
+  "config": {
+    "symbols": [
+      "JPM",
+      "BAC",
+      "GS",
+      "MS",
+      "WFC"
+    ],
+    "market": "SPY",
+    "start": "2010-01-01",
+    "alpha": 0.05,
+    "lam": 0.97,
+    "use_log_returns": true,
+    "min_obs": 600,
+    "k": 0.08,
+    "leverage": 5.0,
+    "lrmes_horizon_weeks": 18,
+    "lrmes_cap": 0.999,
+    "q_update_every": 20,
+    "min_tail_obs": 10,
+    "seed": 42,
+    "out_csv": "level94_srisk_daily.csv",
+    "out_json": "level94_srisk_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020
+  },
+  "market": {
+    "symbol": "SPY",
+    "alpha": 0.05
+  },
+  "ranking_by_latest_SISK_desc": [
+    "BAC",
+    "GS",
+    "JPM",
+    "MS",
+    "WFC"
+  ],
+  "assets": {
+    "JPM": {
+      "market_cap_E": 901671796335.0393,
+      "debt_D": 1148076032000.0,
+      "debt_source": "yfinance_totalDebt",
+      "MES_last": -0.029694969373366943,
+      "LRMES_last": 0.4140433385562069,
+      "SRISK_last": 0.0
+    },
+    "BAC": {
+      "market_cap_E": 416048216952.5144,
+      "debt_D": 763981987840.0,
+      "debt_source": "yfinance_totalDebt",
+      "MES_last": -0.03400636819867618,
+      "LRMES_last": 0.4577969016752401,
+      "SRISK_last": 0.0
+    },
+    "GS": {
+      "market_cap_E": 274580133543.13348,
+      "debt_D": 731217985536.0,
+      "debt_source": "yfinance_totalDebt",
+      "MES_last": -0.03292389563860716,
+      "LRMES_last": 0.44712874776176914,
+      "SRISK_last": 0.0
+    },
+    "MS": {
+      "market_cap_E": 290325576149.1118,
+      "debt_D": 467027984384.0,
+      "debt_source": "yfinance_totalDebt",
+      "MES_last": -0.036231467539196566,
+      "LRMES_last": 0.4790839672193602,
+      "SRISK_last": 0.0
+    },
+    "WFC": {
+      "market_cap_E": 305159816507.88873,
+      "debt_D": 424136998912.0,
+      "debt_source": "yfinance_totalDebt",
+      "MES_last": -0.03120693558568486,
+      "LRMES_last": 0.42977533149610203,
+      "SRISK_last": 0.0
+    }
+  },
+  "notes": [
+    "SRISK depends on market cap and debt. If market cap is missing, SRISK will be NaN.",
+    "Debt uses yfinance totalDebt when available; otherwise uses a leverage proxy D=(L-1)*E.",
+    "LRMES is a proxy from MES: LRMES=1-exp(horizon_weeks*MES), bounded."
+  ]
+}

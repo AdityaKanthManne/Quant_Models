@@ -1,0 +1,75 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "market": "SPY",
+    "start": "2010-01-01",
+    "alpha": 0.05,
+    "lam": 0.97,
+    "use_log_returns": true,
+    "min_obs": 600,
+    "clip_u": 1e-06,
+    "compute_lrmes": true,
+    "lrmes_horizon_weeks": 18,
+    "lrmes_cap": 0.999,
+    "seed": 42,
+    "out_csv": "level93_mes_daily.csv",
+    "out_json": "level93_mes_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020
+  },
+  "market": {
+    "symbol": "SPY",
+    "alpha": 0.05
+  },
+  "ranking_by_MES_most_negative_first": [
+    "IWM",
+    "QQQ",
+    "EEM",
+    "EFA",
+    "LQD",
+    "GLD",
+    "TLT"
+  ],
+  "assets": {
+    "QQQ": {
+      "MES_static": -0.02967134152358339,
+      "beta_last": 1.33888129379798
+    },
+    "IWM": {
+      "MES_static": -0.030773164194990887,
+      "beta_last": 1.3002381467037902
+    },
+    "EFA": {
+      "MES_static": -0.024237751086706512,
+      "beta_last": 0.7499063602134394
+    },
+    "EEM": {
+      "MES_static": -0.0254723556011532,
+      "beta_last": 0.9184806886203247
+    },
+    "TLT": {
+      "MES_static": 0.008207921933037581,
+      "beta_last": 0.06472072482186113
+    },
+    "LQD": {
+      "MES_static": -0.0012936684909067072,
+      "beta_last": 0.13087960161995824
+    },
+    "GLD": {
+      "MES_static": 0.0005998925681343833,
+      "beta_last": 0.27313929252363406
+    }
+  }
+}
