@@ -2,7 +2,7 @@ Level-99: EVT (Extreme Value Theory) VaR/ES using POT-GPD (Rolling) + Backtestin
 
 This is the **next step after Level-98 dynamic VaR/ES**: instead of assuming Normal tails (or bootstrapping residuals), we **model the extreme loss tail explicitly** using **Peaks-Over-Threshold (POT)** with a **Generalized Pareto Distribution (GPD)** — fast + realistic in crises.
 
-### Why your previous versions felt slow / error-prone
+Why your previous versions felt slow / error-prone
 
 * Anything involving **custom t-copula integration / PPF/CDF** or large Monte Carlo grids will run long.
 * SciPy-free “manual CDF inversions” often become slow loops.
