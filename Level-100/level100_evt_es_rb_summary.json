@@ -1,0 +1,72 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "use_log_returns": true,
+    "dropna": true,
+    "alpha": 0.05,
+    "q_u": 0.9,
+    "window": 1000,
+    "min_exc": 40,
+    "xi_clip": [
+      -0.45,
+      0.45
+    ],
+    "rebalance": "ME",
+    "max_w": 0.35,
+    "min_w": 0.0,
+    "allow_cash": false,
+    "cash_symbol": "CASH",
+    "use_corr_scale": true,
+    "corr_shrink": 0.15,
+    "tc_bps": 1.0,
+    "seed": 42,
+    "out_daily_csv": "level100_evt_es_rb_daily.csv",
+    "out_weights_csv": "level100_evt_es_rb_weights.csv",
+    "out_json": "level100_evt_es_rb_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2026-01-05",
+    "n_returns": 4025
+  },
+  "rebalancing": {
+    "freq": "ME",
+    "n_rebalances": 146
+  },
+  "performance_gross": {
+    "ann_ret": 0.07415283943536671,
+    "ann_vol": 0.09628342908873154,
+    "sharpe": 0.7701516256450524,
+    "max_dd": -0.2689768271798486
+  },
+  "performance_net": {
+    "ann_ret": 0.07414438817935907,
+    "ann_vol": 0.0962835536238326,
+    "sharpe": 0.7700628548571401,
+    "max_dd": -0.26898481581313194
+  },
+  "turnover": {
+    "avg_rebalance_turnover_L1": 0.009245571165126679,
+    "median_rebalance_turnover_L1": 0.005596956800997831
+  },
+  "quick_var_backtest": {
+    "alpha": 0.05,
+    "exception_rate_vs_empirical_rolling_var": 0.05487603305785124,
+    "note": "Quick sanity check using rolling empirical VaR on portfolio net returns."
+  },
+  "notes": [
+    "Weights are long-only and sum to 1 (no leverage).",
+    "Tail-risk model uses EVT POT-GPD ES on losses per asset; falls back to empirical ES when exceedances are too few.",
+    "Rebalance dates are mapped to actual trading days (prevents index expansion bugs)."
+  ]
+}
