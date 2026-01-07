@@ -1,160 +1,221 @@
+<!-- ===================== BANNER ===================== -->
 
-```md
-# ♟️ The Quant Chessboard  
-## 100 Levels. 100 Positions. One Complete Game.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ashutosh1919/master/assets/banner.png" alt="Quant Banner" width="100%">
+</p>
 
-> Think of this repository as a **full chessboard**.  
-> Each square is a quantitative model.  
-> Each move increases complexity, depth, and risk awareness.
+<h1 align="center">100 Quantitative Models</h1>
+<h3 align="center">A Hands-On Journey Through Modern Quantitative Finance</h3>
 
-You don’t jump to checkmate.  
-You build position by position.
-
----
-
-## The 10 × 10 Quant Board
-
-```
-
-┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
-│ L01│ L02│ L03│ L04│ L05│ L06│ L07│ L08│ L09│ L10│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L11│ L12│ L13│ L14│ L15│ L16│ L17│ L18│ L19│ L20│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L21│ L22│ L23│ L24│ L25│ L26│ L27│ L28│ L29│ L30│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L31│ L32│ L33│ L34│ L35│ L36│ L37│ L38│ L39│ L40│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L41│ L42│ L43│ L44│ L45│ L46│ L47│ L48│ L49│ L50│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L51│ L52│ L53│ L54│ L55│ L56│ L57│ L58│ L59│ L60│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L61│ L62│ L63│ L64│ L65│ L66│ L67│ L68│ L69│ L70│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L71│ L72│ L73│ L74│ L75│ L76│ L77│ L78│ L79│ L80│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L81│ L82│ L83│ L84│ L85│ L86│ L87│ L88│ L89│ L90│
-├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
-│ L91│ L92│ L93│ L94│ L95│ L96│ L97│ L98│ L99│L100│
-└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
-
-```
+<p align="center">
+  <img src="https://img.shields.io/badge/Quantitative%20Finance-Research--Driven-blue">
+  <img src="https://img.shields.io/badge/Python-Production%20Grade-green">
+  <img src="https://img.shields.io/badge/Models-100+-purple">
+  <img src="https://img.shields.io/badge/Focus-Risk%20%7C%20Stability%20%7C%20Robustness-black">
+</p>
 
 ---
 
-## How to Read the Board
+## Why This Repository Exists
 
-Each **row** represents a strategic phase.  
-Each **square** represents a self-contained quantitative model.
+**Learn_DSA_Quant** was built from a simple belief:
 
-You can move:
-- **Left → Right** to increase technical complexity  
-- **Top → Bottom** to increase risk awareness and realism  
+> *You don’t learn quantitative finance by reading formulas.  
+> You learn it by building systems that break — and fixing them.*
 
-There are no shortcuts across the board.
+Instead of treating quant concepts as isolated theory, this repository turns them into **working research systems** — from simple trading rules to **tail-risk-aware portfolio engines** used in professional environments.
 
----
+Each level represents a **real step forward**:
+- Understanding market behavior  
+- Discovering why models fail  
+- Designing systems that survive real data  
 
-## Board Phases (Strategic Meaning)
-
-### Opening — Foundations & Market Intuition  
-**Levels 01–10**
-- Trading signals
-- Time-series mechanics
-- Portfolio basics
-- Volatility surfaces
-
-> Like opening principles in chess — control the board before attacking.
+This is **not** a collection of shortcuts or toy notebooks.  
+It is a **complete quantitative learning arc**, built patiently and deliberately.
 
 ---
 
-### Early Middlegame — Structure & Interaction  
-**Levels 11–25**
-- Volatility modeling
-- Execution mechanics
-- Correlation networks
-- Market microstructure
+## What You Will Find Here
 
-> Pieces begin to interact. Mistakes now have consequences.
+<table>
+<tr>
+<td>
 
----
+- 100 progressively advanced models  
+- Clear separation of **idea → implementation → evaluation**  
+- Explicit assumptions and failure modes  
+- Research-grade metrics  
+- Strong focus on **risk and robustness**
 
-### Middlegame — Intelligence & Adaptation  
-**Levels 26–50**
-- Machine learning & reinforcement learning
-- Regime detection
-- Drift and decay
-- Walk-forward validation
+</td>
+<td align="center">
 
-> This is where most games are decided — and most models fail.
+<img src="https://raw.githubusercontent.com/devicons/devicon/master/icons/python/python-original.svg" width="90">
+<br>
+<b>Python-First</b>
 
----
-
-### Late Middlegame — Capital Allocation  
-**Levels 51–74**
-- Risk parity
-- HRP
-- Black-Litterman
-- Drawdown control
-
-> Signals matter less. Position sizing matters more.
+</td>
+</tr>
+</table>
 
 ---
 
-### Endgame — Risk & Survival  
-**Levels 75–100**
-- VaR / CVaR
-- EVT and tail risk
-- Systemic risk
-- Regulatory-grade validation
-- Risk budgeting engines
+## Repository at a Glance
 
-> Winning here is not about returns.  
-> It’s about **not losing**.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/platane/snk/output/github-contribution-grid-snake.svg" width="90%">
+</p>
 
 ---
 
-## Why a Chessboard?
+## Table of Contents — 100 Quant Models
 
-Quantitative finance is not about finding *one brilliant move*.  
-It is about **sequencing correct decisions under uncertainty**.
-
-- Early mistakes compound  
-- Overconfidence gets punished  
-- Risk ignored early dominates late  
-
-This repository is structured the same way.
+> Each level is **self-contained** with code, data, metrics, and explanation.
 
 ---
 
-## How to Use the Board
+### Foundations & Trading Systems
+<img align="right" src="https://raw.githubusercontent.com/devicons/devicon/master/icons/numpy/numpy-original.svg" width="70">
 
-- Start at **L01** and move sequentially for the full journey  
-- Jump to any square to study a specific domain  
+- Level 01 – SMA Crossover & Signal Basics  
+- Level 02 – Strategy Evaluation & Returns  
+- Level 03 – Portfolio Construction & Rebalancing  
+- Level 04 – Clean Time-Series Engineering  
+- Level 05 – Signal Robustness & Filters  
+- Level 06 – Vectorized Strategy Backtesting  
+- Level 07 – Rolling Metrics & Stability  
+- Level 08 – Risk-Adjusted Performance  
+- Level 09 – Signal Diagnostics  
+- Level 10 – Implied Volatility Surface  
+
+---
+
+### Volatility, Options & Market Behavior
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/3/3a/Black_scholes_greeks.svg" width="90">
+
+- Levels 11–18  
+Implied volatility, local volatility, skew, term structure, regimes
+
+---
+
+### Execution & Market Microstructure
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/5/5c/Order_book_depth_chart.png" width="120">
+
+- Levels 19–25  
+VWAP, POV, liquidity-aware execution, correlation graphs, MSTs
+
+---
+
+### Machine Learning & Reinforcement Learning
+<img align="right" src="https://raw.githubusercontent.com/devicons/devicon/master/icons/pytorch/pytorch-original.svg" width="80">
+
+- Levels 26–37  
+Dynamic programming, DQN, PPO, feature importance, stability checks
+
+---
+
+### Regimes, Drift & Model Monitoring
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/3/3f/Concept_drift.png" width="120">
+
+- Levels 38–50  
+Regime shifts, drift detection, walk-forward validation
+
+---
+
+### Portfolio Construction & Allocation
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/2/2e/Modern_portfolio_theory.png" width="120">
+
+- Levels 51–74  
+Risk parity, HRP, Black-Litterman, leverage control, drawdowns
+
+---
+
+### Risk, Tails & Systemic Modeling
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/1/1a/Heavy_tail_distribution.png" width="120">
+
+- Levels 75–85  
+VaR, CVaR, EVT, copulas, tail dependence
+
+---
+
+### Systemic Risk & Extreme Events
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/6/6c/Financial_network.svg" width="120">
+
+- Levels 86–94  
+CoVaR, MES, SRISK, spillovers, market networks
+
+---
+
+### Professional-Grade Risk Engines
+<img align="right" src="https://upload.wikimedia.org/wikipedia/commons/4/41/Risk_management_cycle.png" width="120">
+
+- Levels 95–100  
+Regulatory backtesting, dynamic VaR, EVT ES risk budgeting
+
+---
+
+## How This Project Is Built
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" width="100%">
+</p>
+
+- Research-first mindset  
+- Transparent assumptions and fallbacks  
+- Metrics over visuals  
+- Stability over peak performance  
+
+Every model answers one question:
+
+> **Would I trust this in production?**
+
+---
+
+## Who This Is For
+
+<table>
+<tr>
+<td align="center"><b>Quant Researchers</b></td>
+<td align="center"><b>Data Scientists</b></td>
+<td align="center"><b>Graduate Students</b></td>
+<td align="center"><b>Practitioners</b></td>
+</tr>
+<tr>
+<td align="center">Buy-side & sell-side</td>
+<td align="center">Moving into finance</td>
+<td align="center">FE / OR / Econ</td>
+<td align="center">Reference systems</td>
+</tr>
+</table>
+
+---
+
+## How to Navigate
+
+- Follow levels sequentially for the full journey  
+- Jump to domains as a reference  
 - Use `.txt` files for intuition  
-- Use notebooks for experimentation and extension  
+- Use notebooks to experiment and extend  
 
 ---
 
-## Final Position
+## Final Thought
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/fire.png" width="100%">
+</p>
 
 This repository represents **curiosity sustained through discipline**.
 
-If you play through the entire board, you won’t just understand models.  
-You’ll understand **why good quant systems survive and bad ones collapse**.
-
-♟️ *The goal isn’t checkmate.*  
-♟️ *The goal is staying on the board.*
-```
+If you explore it carefully, you won’t just see models.  
+You’ll see **how quantitative thinking evolves under uncertainty**.
 
 ---
 
-### Why this is powerful
+### Want More?
+- Recruiter one-pager  
+- PhD application portfolio  
+- GitHub Pages site  
+- Interactive dashboard previews  
 
-* Instantly **visual without images**
-* Easy to remember and explain in interviews
-* Signals **systems thinking**
-* Nobody else on GitHub is doing this well
-
-
-Say the word ♟️
+Open an issue or reach out.
