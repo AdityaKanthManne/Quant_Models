@@ -1,275 +1,160 @@
-# 100 Quantitative Models  
-## A Hands-On Journey Through Modern Quantitative Finance
+
+```md
+# ♟️ The Quant Chessboard  
+## 100 Levels. 100 Positions. One Complete Game.
+
+> Think of this repository as a **full chessboard**.  
+> Each square is a quantitative model.  
+> Each move increases complexity, depth, and risk awareness.
+
+You don’t jump to checkmate.  
+You build position by position.
 
 ---
 
-> **This repository was built the hard way — by designing models, watching them fail, and making them better.**
+## The 10 × 10 Quant Board
+
+```
+
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ L01│ L02│ L03│ L04│ L05│ L06│ L07│ L08│ L09│ L10│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L11│ L12│ L13│ L14│ L15│ L16│ L17│ L18│ L19│ L20│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L21│ L22│ L23│ L24│ L25│ L26│ L27│ L28│ L29│ L30│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L31│ L32│ L33│ L34│ L35│ L36│ L37│ L38│ L39│ L40│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L41│ L42│ L43│ L44│ L45│ L46│ L47│ L48│ L49│ L50│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L51│ L52│ L53│ L54│ L55│ L56│ L57│ L58│ L59│ L60│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L61│ L62│ L63│ L64│ L65│ L66│ L67│ L68│ L69│ L70│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L71│ L72│ L73│ L74│ L75│ L76│ L77│ L78│ L79│ L80│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L81│ L82│ L83│ L84│ L85│ L86│ L87│ L88│ L89│ L90│
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ L91│ L92│ L93│ L94│ L95│ L96│ L97│ L98│ L99│L100│
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+
+```
 
 ---
 
-## Why This Repository Exists
+## How to Read the Board
 
-**Learn_DSA_Quant** was created from a simple but demanding idea:
+Each **row** represents a strategic phase.  
+Each **square** represents a self-contained quantitative model.
 
-> *You don’t learn quantitative finance by memorizing formulas.  
-> You learn it by building systems that break — and understanding why.*
+You can move:
+- **Left → Right** to increase technical complexity  
+- **Top → Bottom** to increase risk awareness and realism  
 
-Instead of treating quantitative concepts as isolated theory, this repository turns them into **working research systems** — from simple trading rules to **tail-risk-aware portfolio engines** used in professional environments.
-
-Each of the 100 levels represents a **real step forward**:
-- Understanding market behavior  
-- Discovering failure modes  
-- Designing systems that survive real data  
-
-This is **not** a collection of shortcuts or toy notebooks.  
-It is a **complete quantitative learning arc**, built patiently and deliberately.
+There are no shortcuts across the board.
 
 ---
 
-## What You Will Find Here
+## Board Phases (Strategic Meaning)
 
-**100 progressively advanced quantitative models**, each with:
+### Opening — Foundations & Market Intuition  
+**Levels 01–10**
+- Trading signals
+- Time-series mechanics
+- Portfolio basics
+- Volatility surfaces
 
-- A clearly defined idea  
-- A concrete implementation  
-- Explicit assumptions and limitations  
-- Research-grade metrics (not cosmetic plots)  
-- A strong emphasis on **risk, stability, and robustness**
-
-Every level answers two questions:
-
-> **How does this model work?**  
-> **What breaks when markets change?**
+> Like opening principles in chess — control the board before attacking.
 
 ---
 
-## Repository Structure at a Glance
+### Early Middlegame — Structure & Interaction  
+**Levels 11–25**
+- Volatility modeling
+- Execution mechanics
+- Correlation networks
+- Market microstructure
 
-Level 01 → Level 10 | Strategy & time-series foundations
-Level 11 → Level 20 | Volatility, options, intraday behavior
-Level 21 → Level 30 | Portfolio analytics & ML signals
-Level 31 → Level 40 | Robustness & online learning
-Level 41 → Level 50 | Regimes, drift & walk-forward testing
-Level 51 → Level 60 | Portfolio construction frameworks
-Level 61 → Level 70 | Risk parity, HRP, leverage control
-Level 71 → Level 80 | Advanced risk & dependence modeling
-Level 81 → Level 90 | Systemic risk & market networks
-Level 91 → Level 100 | Extreme risk & professional engines
-
-yaml
-Copy code
-
-Each level is **self-contained**, yet clearly connected to the broader system.
+> Pieces begin to interact. Mistakes now have consequences.
 
 ---
 
-## Table of Contents — 100 Quant Models
+### Middlegame — Intelligence & Adaptation  
+**Levels 26–50**
+- Machine learning & reinforcement learning
+- Regime detection
+- Drift and decay
+- Walk-forward validation
 
-> Each level includes code, data, metrics, and written intuition.
-
----
-
-### Foundations & Trading Systems
-- Level 01 – SMA Crossover & Signal Basics  
-- Level 02 – Strategy Evaluation & Returns  
-- Level 03 – Portfolio Construction & Rebalancing  
-- Level 04 – Clean Time-Series Engineering  
-- Level 05 – Signal Robustness & Filters  
-- Level 06 – Vectorized Strategy Backtesting  
-- Level 07 – Rolling Metrics & Stability  
-- Level 08 – Risk-Adjusted Performance  
-- Level 09 – Signal Diagnostics  
-- Level 10 – Implied Volatility Surface  
+> This is where most games are decided — and most models fail.
 
 ---
 
-### Volatility, Options & Market Behavior
-- Levels 11–18  
-  Volatility structure, local volatility (Dupire), skew, term structure, regimes
+### Late Middlegame — Capital Allocation  
+**Levels 51–74**
+- Risk parity
+- HRP
+- Black-Litterman
+- Drawdown control
+
+> Signals matter less. Position sizing matters more.
 
 ---
 
-### Execution & Market Microstructure
-- Levels 19–25  
-  VWAP / POV execution, liquidity-aware slicing, correlation networks, MSTs
+### Endgame — Risk & Survival  
+**Levels 75–100**
+- VaR / CVaR
+- EVT and tail risk
+- Systemic risk
+- Regulatory-grade validation
+- Risk budgeting engines
+
+> Winning here is not about returns.  
+> It’s about **not losing**.
 
 ---
 
-### Machine Learning & Reinforcement Learning
-- Levels 26–37  
-  Dynamic programming, DQN, PPO, feature importance, decile testing, stability
+## Why a Chessboard?
+
+Quantitative finance is not about finding *one brilliant move*.  
+It is about **sequencing correct decisions under uncertainty**.
+
+- Early mistakes compound  
+- Overconfidence gets punished  
+- Risk ignored early dominates late  
+
+This repository is structured the same way.
 
 ---
 
-### Regimes, Drift & Model Monitoring
-- Levels 38–50  
-  Volatility risk premium, drift detection, rolling diagnostics, walk-forward testing
+## How to Use the Board
 
----
-
-### Portfolio Construction & Allocation
-- Levels 51–74  
-  Risk parity, HRP, Black-Litterman, regime portfolios, drawdown control
-
----
-
-### Risk, Tails & Systemic Modeling
-- Levels 75–85  
-  VaR, CVaR, Cornish-Fisher, bootstrapping, copulas, EVT
-
----
-
-### Systemic Risk & Extreme Events
-- Levels 86–94  
-  CoVaR, MES, SRISK, spillovers, Granger networks, connectedness
-
----
-
-### Professional-Grade Risk Engines
-- Levels 95–100  
-  Regulatory backtesting, dynamic VaR, EVT Expected Shortfall risk budgeting
-
----
-
-## What This Project Covers (and Why It Matters)
-
-### Trading & Signal Foundations (Levels 1–10)
-
-These early models build intuition around **how signals are formed, evaluated, and deployed**.
-
-You learn:
-- How simple ideas scale into portfolio systems  
-- Why signal timing and alignment matter  
-- How small implementation choices create large outcome differences  
-
----
-
-### Volatility & Derivatives Modeling (Levels 11–18)
-
-Volatility is treated not as a statistic, but as a **market state variable**.
-
-You explore:
-- Implied and local volatility surfaces  
-- Skew, term structure, and regime behavior  
-- How options markets encode risk perception  
-
----
-
-### Execution & Market Structure (Levels 19–25)
-
-Good strategies fail without good execution.
-
-You gain intuition for:
-- Where alpha leaks away  
-- How liquidity constraints shape outcomes  
-- Why execution is part of the model  
-
----
-
-### Machine Learning for Alpha (Levels 26–37)
-
-Machine learning is used **carefully, not blindly**.
-
-The focus is on:
-- When ML helps  
-- When it overfits  
-- How to validate signals economically, not just statistically  
-
----
-
-### Regimes, Drift & Model Survival (Levels 38–50)
-
-Markets evolve. Models must adapt.
-
-These levels reflect how models are monitored **after deployment**, not just before:
-- Regime changes  
-- Concept drift  
-- Performance decay  
-
----
-
-### Portfolio Construction & Allocation (Levels 51–74)
-
-Here, signals give way to **capital allocation discipline**.
-
-You build:
-- Risk-balanced portfolios  
-- Regime-aware allocations  
-- Drawdown-controlled leverage systems  
-
-This is where individual models become **investment systems**.
-
----
-
-### Risk, Tails & Dependence (Levels 75–85)
-
-Risk is treated as a **first-class object**, not an afterthought.
-
-You implement:
-- VaR and CVaR under multiple assumptions  
-- Dependence modeling with copulas  
-- EVT-based tail estimation  
-
----
-
-### Systemic Risk & Market Networks (Levels 86–94)
-
-Markets are connected systems, not isolated assets.
-
-You analyze:
-- Systemic importance  
-- Spillover effects  
-- Network-driven risk  
-
----
-
-### Extreme Risk & Professional-Grade Systems (Levels 95–100)
-
-The final levels bring everything together.
-
-You build:
-- Backtested VaR / ES validation engines  
-- Dynamic risk estimation systems  
-- EVT-based Expected Shortfall risk-budgeted portfolios  
-
-These mirror **institutional risk frameworks**.
-
----
-
-## How This Project Is Built
-
-- Research-first mindset  
-- Transparent assumptions and fallbacks  
-- Metrics over visuals  
-- Stability over peak performance  
-
-Every model is written with one question in mind:
-
-> **Would I trust this in production?**
-
----
-
-## Who Will Benefit Most
-
-- Aspiring Quant Researchers and Analysts  
-- Data Scientists transitioning into finance  
-- Graduate students in quantitative disciplines  
-- Practitioners seeking a structured reference  
-
----
-
-## How to Navigate
-
-- Follow levels sequentially for the full journey  
-- Jump to specific domains as a reference  
-- Use `.txt` files for intuition and theory  
+- Start at **L01** and move sequentially for the full journey  
+- Jump to any square to study a specific domain  
+- Use `.txt` files for intuition  
 - Use notebooks for experimentation and extension  
 
 ---
 
-## Closing Thought
+## Final Position
 
 This repository represents **curiosity sustained through discipline**.
 
-If you explore it carefully, you will not just see models.  
-You will see **how quantitative thinking evolves under uncertainty**.
+If you play through the entire board, you won’t just understand models.  
+You’ll understand **why good quant systems survive and bad ones collapse**.
+
+♟️ *The goal isn’t checkmate.*  
+♟️ *The goal is staying on the board.*
+```
+
+---
+
+### Why this is powerful
+
+* Instantly **visual without images**
+* Easy to remember and explain in interviews
+* Signals **systems thinking**
+* Nobody else on GitHub is doing this well
+
+
+Say the word ♟️
