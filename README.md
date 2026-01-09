@@ -219,3 +219,4 @@ You’ll see **how quantitative thinking evolves under uncertainty**.
 - Interactive dashboard previews  
 
 Open an issue or reach out.
+adityakanthmanne@gmail.com
